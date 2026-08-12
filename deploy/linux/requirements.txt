@@ -1,0 +1,30 @@
+# Dependencias Python do bot + site, unificadas num venv so.
+#
+# Levantado por leitura direta dos imports em 09/08/2026 (grep em *.py), nao
+# de memoria -- ver o historico da migracao para o comando exato usado.
+#
+# Bot (campo_bot_telegram): requests, psutil, pandas, Pillow, playwright
+# Site (auto relaótio):   pandas, openpyxl, playwright, fastapi, uvicorn,
+#                         jinja2, python-multipart, itsdangerous, requests,
+#                         lxml, gspread, oauth2client
+# (pandas/openpyxl/playwright/requests aparecem nos dois -- listados uma vez)
+
+# --- comuns aos dois ---
+pandas
+openpyxl
+playwright
+requests
+
+# --- so do bot ---
+psutil
+Pillow
+
+# --- so do site ---
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+itsdangerous
+lxml
+gspread
+oauth2client

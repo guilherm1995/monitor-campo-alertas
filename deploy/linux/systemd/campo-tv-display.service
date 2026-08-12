@@ -1,0 +1,31 @@
+[Unit]
+Description=Sessao X minima para o Painel de TV do bot CAMPO (monitor/TV fisico)
+# Toma conta do tty1 como sessao grafica -- sem o Conflicts, o getty normal
+# do tty1 ficaria brigando com o Xorg pelo mesmo terminal.
+Conflicts=getty@tty1.service
+After=getty@tty1.service systemd-user-sessions.service
+
+[Service]
+User=operacional
+Group=operacional
+# startx precisa de um HOME para escrever o .Xauthority -- /opt/operacional ja e
+# do usuario 'operacional' (instalar.sh, passo 8 "pastas de dados"), sem precisar
+# dar home de verdade nem shell de login pro usuario de servico.
+Environment=HOME=/opt/operacional
+Environment=XAUTHORITY=/opt/operacional/.Xauthority
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+PAMName=login
+# vt1 crua, sem display manager (gdm/lightdm) -- so essa sessao X parada e o
+# Painel de TV que abre dentro dela quando o campo-bot.service pedir.
+ExecStart=/usr/bin/startx /opt/operacional/xinitrc -- :0 vt1 -nolisten tcp
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

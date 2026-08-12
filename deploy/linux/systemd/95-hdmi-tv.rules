@@ -1,0 +1,4 @@
+# Ao conectar/desconectar um monitor (evento DRM de hotplug), dispara o
+# servico que liga/espelha a TV via xrandr no :0. --no-block para o udev nao
+# ficar preso esperando o systemd.
+ACTION=="change", SUBSYSTEM=="drm", RUN+="/usr/bin/systemctl start --no-block hdmi-tv.service"

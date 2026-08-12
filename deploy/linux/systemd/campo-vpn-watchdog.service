@@ -1,0 +1,7 @@
+[Unit]
+Description=Guardiao externo da VPN (reinicia campo-vpn se o tunel travar)
+After=campo-vpn.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/operacional/bin/campo-vpn-watchdog.sh

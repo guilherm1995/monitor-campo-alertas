@@ -1,0 +1,38 @@
+[Unit]
+Description=VPN sempre-ativa (OpenConnect/FortiGate) para o bot CAMPO
+# O bot e o site dependem da VPN para alcancar o CAMPO e o Autenticador. Ordena o
+# start (Requires+After) mas NAO trava o boot nela -- se a VPN cair depois,
+# o proprio vpn_sempre_ativa.py reconecta sozinho, e o bot so vai falhar as
+# chamadas de rede dele ate a VPN voltar (ja tem retry, nao precisa que o
+# systemd reinicie ninguem por causa disso).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/operacional/bot
+ExecStart=/opt/operacional/venv/bin/python3 /opt/operacional/bot/vpn_sempre_ativa.py
+
+# O openconnect precisa criar interface tun e mexer em rota -- por isso root.
+# Para apertar depois (nao rodar como root de verdade), a alternativa e:
+#   User=operacional
+#   AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+#   CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# Isso NAO foi testado ainda -- comece com root, confirme que conecta, só
+# depois tente apertar (algumas versões do openconnect ainda pedem mais
+# capability que essas duas para o vpnc-script mexer nas rotas).
+User=root
+
+Restart=always
+RestartSec=5
+
+# O script já tem seu próprio backoff (5s -> 120s) para reconexão da VPN em
+# si; este RestartSec cobre só o caso do PROCESSO PYTHON morrer de vez
+# (exceção não tratada, etc.), que é raro e deve voltar rápido.
+
+# journald já captura stdout/stderr sozinho -- nao precisa configurar nada
+# aqui para ter log; "journalctl -u campo-vpn -f" mostra ao vivo.
+SyslogIdentifier=campo-vpn
+
+[Install]
+WantedBy=multi-user.target

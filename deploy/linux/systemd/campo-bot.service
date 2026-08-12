@@ -1,0 +1,77 @@
+[Unit]
+Description=Bot de monitoramento CAMPO (backlog, alertas, varredura)
+# Soft-dependency, nao hard-block: o bot ja tem retry proprio para VPN e
+# WhatsApp fora do ar (ver os WARNING de "Falha de rede" no codigo). Pedir
+# essa ordem so evita a primeira volta gritando erro à toa no boot. Idem
+# para o campo-tv-display: o Painel de TV so e aberto sob pedido
+# (/exibirpaineltv), entao o bot sobe normalmente mesmo se a sessao X ainda
+# nao estiver de pe -- so falharia em abrir a janela SE alguem pedisse
+# antes disso, o que na pratica nunca acontece nos primeiros segundos.
+After=network-online.target campo-vpn.service campo-whatsapp.service campo-tv-display.service
+Wants=network-online.target campo-tv-display.service
+
+[Service]
+Type=simple
+# CRITICO: o bot resolve dados/, logs/, relatorios/ e o perfil do navegador
+# pelo diretorio ATUAL (era o mesmo motivo do -WorkingDirectory obrigatorio
+# na tarefa do Windows -- sem isso ele sobe com 0 OS notificadas e sem a
+# base OFS).
+WorkingDirectory=/opt/operacional/bot
+# TEM que bater com o PLAYWRIGHT_BROWSERS_PATH usado no instalar.sh na hora
+# de baixar o Chromium -- sem isso, em runtime o Playwright procura em
+# ~/.cache/ms-playwright, que nem existe (o usuario 'operacional' nao tem HOME,
+# criado com --no-create-home) e o bot falha ao abrir o navegador.
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/operacional/pw-browsers
+# CRITICO (descoberto testando o login VISIVEL em 09/08/2026): o usuario
+# 'operacional' foi criado com --no-create-home, entao sem HOME o Chromium NAO
+# ABRE -- o chrome_crashpad_handler falha com "--database is required" (nao
+# consegue criar a pasta de banco de crash em ~/.config) e o processo morre
+# com SIGTRAP. Vale tanto para headless quanto para headed. HOME=/opt/operacional
+# porque essa pasta ja existe e e dona do 'operacional' (ver instalar.sh passo 8).
+Environment=HOME=/opt/operacional
+# Mesmo :0 da sessao X do campo-tv-display.service (TV/monitor fisico) -- sem
+# isso o Painel de TV (tkinter) nao tem onde abrir janela ("no display
+# name and no $DISPLAY environment variable"). Precisa ser o MESMO usuario
+# (operacional) das duas units para o .Xauthority em HOME bater.
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/opt/operacional/.Xauthority
+# Padrao de producao (11/08/2026): Painel de TV sempre ligado na TV fisica
+# desde o boot, sem precisar de /exibirpaineltv toda vez. O navegador do CAMPO
+# fica OCULTO por padrao (nao setar NAVEGADOR_VISIVEL_INICIAL aqui -- ausencia
+# = oculto, e o comportamento que o codigo ja assume por padrao). Os dois
+# continuam ajustaveis a qualquer momento por comando no grupo
+# (/exibirpaineltv, /ocultarpaineltv, /exibirnavegador, /ocultarnavegador) --
+# isto so define o estado ao ligar/reiniciar.
+Environment=PAINEL_TV_INICIAL=1
+ExecStart=/opt/operacional/venv/bin/python3 /opt/operacional/bot/bot_campo_monitoramento.py
+User=operacional
+Group=operacional
+
+Restart=always
+RestartSec=10
+
+# --- teto de memoria por CGROUP, nao por polling em Python ---
+#
+# No Windows a gente escreveu PISO_RAM_LIVRE_MB / LIMITE_RAM_BOT_MB: uma
+# thread checando a cada 30s e matando o processo na mao. No Linux o kernel
+# faz isso de graca: o systemd poe bot + TODOS os processos filhos dele
+# (inclusive o Chromium que o Playwright abre) no MESMO cgroup por padrao,
+# entao um MemoryMax aqui cobre os dois vazamentos JUNTOS -- exatamente o
+# problema que a guarda em Python tentava resolver working around a
+# limitacao do SO, e aqui o SO ja resolve.
+#
+# 4G e CHUTE INICIAL, baseado no que foi medido no Windows em 08/08/2026
+# (bot ~540 MB/h + Chromium ~700 MB/h somados, ~1,2 GB/h) -- NAO FOI TESTADO
+# no Linux ainda. Ajuste depois de ter telemetria real de la (o alocador e
+# outro, glibc com malloc_trim deve se comportar diferente do pymalloc no
+# Windows -- pode crescer mais devagar, ou nao).
+MemoryMax=4G
+# Ao estourar o teto, mata o processo (nao so avisa) e o Restart=always
+# acima sobe de novo, limpo -- mesmo espirito do "reinicio controlado em vez
+# de deixar a maquina afundar" que tinha no LIMITE_RAM_BOT_MB do Windows.
+OOMPolicy=kill
+
+SyslogIdentifier=campo-bot
+
+[Install]
+WantedBy=multi-user.target

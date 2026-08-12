@@ -1,0 +1,19 @@
+[Unit]
+Description=Ponte WhatsApp (Baileys) para alertas do bot CAMPO
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/operacional/bot
+ExecStart=/usr/bin/node /opt/operacional/bot/index.js
+User=operacional
+Group=operacional
+
+Restart=always
+RestartSec=5
+
+SyslogIdentifier=campo-whatsapp
+
+[Install]
+WantedBy=multi-user.target

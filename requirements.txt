@@ -1,0 +1,11 @@
+pandas
+openpyxl
+Pillow
+playwright
+requests
+urllib3
+psutil
+gspread
+oauth2client
+pywin32; sys_platform == "win32"
+pywinauto; sys_platform == "win32"

@@ -1,0 +1,17 @@
+[Unit]
+Description=Auto-ligar/espelhar a TV (HDMI) na sessao X do Painel
+# So faz sentido com a sessao X de pe (:0). Nao exige (Requires) para nao
+# arrastar a ordem de boot; se o X nao estiver no ar, o xrandr falha inofensivo.
+After=campo-tv-display.service
+
+[Service]
+Type=oneshot
+# ROOT de proposito (sem User=): o script escreve em /sys/class/drm/.../status
+# para forcar a deteccao da HDMI, que so root pode fazer (porta com HPD
+# defeituoso -- ver comentario no hdmi-tv.sh). Os comandos que tocam o
+# DISPLAY (xrandr, unclutter) o proprio script delega para 'operacional' via
+# runuser -- nao precisam de Environment= aqui.
+ExecStart=/opt/operacional/bin/hdmi-tv.sh
+
+[Install]
+WantedBy=multi-user.target

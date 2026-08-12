@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-alerta-grupo",
+  "version": "1.0.0",
+  "description": "Serviço standalone que envia alertas para um grupo do WhatsApp via Baileys, para ser consumido pelo bot_campo_monitoramento.py",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "listar-grupos": "node index.js --listar-grupos"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "allowScripts": {
+    "@whiskeysockets/baileys@6.7.23": true
+  }
+}

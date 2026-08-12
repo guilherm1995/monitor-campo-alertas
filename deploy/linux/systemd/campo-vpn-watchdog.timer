@@ -1,0 +1,11 @@
+[Unit]
+Description=Checagem periodica da saude da VPN (a cada 2 min)
+
+[Timer]
+# Comeca 3 min apos o boot (da tempo da VPN subir) e repete a cada 2 min.
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

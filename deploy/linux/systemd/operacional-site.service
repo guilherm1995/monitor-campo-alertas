@@ -1,0 +1,27 @@
+[Unit]
+Description=Site/Painel OPERACIONAL
+After=network-online.target campo-bot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/operacional/site
+# O site tambem usa o Chromium do Playwright (backlog_render.py, para gerar
+# as imagens) -- mesmo motivo do campo-bot.service: tem que apontar pro mesmo
+# lugar onde o instalar.sh baixou o navegador.
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/operacional/pw-browsers
+# CRITICO: mesmo motivo do campo-bot.service -- sem HOME o Chromium do
+# Playwright falha (crashpad "--database is required" -> SIGTRAP). O site
+# gera as imagens de backlog com Chromium, entao precisa disto tambem.
+Environment=HOME=/opt/operacional
+ExecStart=/opt/operacional/venv/bin/python3 /opt/operacional/site/iniciar_site.py
+User=operacional
+Group=operacional
+
+Restart=always
+RestartSec=5
+
+SyslogIdentifier=operacional-site
+
+[Install]
+WantedBy=multi-user.target
