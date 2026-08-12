@@ -203,6 +203,45 @@ else
   echo "          rode 'sudo amixer -c 0 sset Master unmute 85% && sudo alsactl store'"
 fi
 
+# Saida padrao = HDMI da TV. O bot chama 'mpg123' sem indicar dispositivo,
+# entao sem isto o alerta vai para a saida analogica (card 0, device 0) e sai
+# numa caixa ligada no P2 -- nao no alto-falante da TV, que e onde a operacao
+# escuta. 'type plug' nao e opcional: o HDMI aceita 48 kHz e o mp3 do alerta e
+# 44,1 kHz; sem a camada de conversao o mpg123 nem abre o dispositivo.
+#
+# O numero do device de HDMI e descoberto no 'aplay -l' em vez de fixado: em
+# outra maquina (ou com outra TV) ele muda, e um hw:0,3 chumbado deixaria o
+# alerta mudo sem nenhum erro visivel.
+# Primeiro tenta a saida que anuncia NOME de TV no EDID (ex.: "[Philips HDTV]"):
+# as portas vazias aparecem com rotulo generico "[HDMI 1]", "[HDMI 2]". Se
+# nenhuma anunciar nome -- caso desta placa, cujo EDID as vezes vem vazio --
+# cai na primeira HDMI da lista.
+hdmi_dev=$(aplay -l 2>/dev/null | grep -E 'device [0-9]+: HDMI' | grep -vE '\[HDMI [0-9]+\]$' \
+           | sed -n 's/^card \([0-9]\+\).*device \([0-9]\+\):.*/\1,\2/p' | head -1)
+[ -n "$hdmi_dev" ] || hdmi_dev=$(aplay -l 2>/dev/null \
+           | sed -n 's/^card \([0-9]\+\).*device \([0-9]\+\): HDMI.*/\1,\2/p' | head -1)
+if [ -n "$hdmi_dev" ]; then
+  cat > /etc/asound.conf <<ASOUND
+# Saida de audio padrao = HDMI da TV de producao.
+# Gerado pelo instalar.sh; ver comentario no passo 2h.
+pcm.!default {
+    type plug
+    slave.pcm "hw:${hdmi_dev}"
+}
+
+ctl.!default {
+    type hw
+    card ${hdmi_dev%%,*}
+}
+ASOUND
+  chmod 644 /etc/asound.conf
+  ok "audio: saida padrao apontada para o HDMI (hw:${hdmi_dev}) -- alerta sai na TV"
+else
+  echo "  [aviso] nenhuma saida HDMI no 'aplay -l' (TV desligada na instalacao?)."
+  echo "          O alerta vai sair pela saida analogica. Com a TV ligada, rode"
+  echo "          este passo de novo para gerar o /etc/asound.conf."
+fi
+
 # --------------------------------------------------------------------------
 titulo "2i. Comando /reiniciar (sudoers)"
 # O bot roda como 'operacional' (sem privilegio) mas o comando /reiniciar no grupo

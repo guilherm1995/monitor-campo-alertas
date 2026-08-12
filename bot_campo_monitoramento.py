@@ -515,7 +515,13 @@ ARQUIVO_HISTORICO_PAINEL = os.path.join(PASTA_DADOS, "historico_painel.json")
 # é lenta (chega a 35s) e depende da VPN, então roda numa thread à parte e
 # entrega o resultado por fila, igual ao clima.
 FILA_STATUS_AUTENTICADOR = queue.Queue()
-INTERVALO_STATUS_AUTENTICADOR_SEG = 90
+# 10 min, e não um intervalo curto: o CSV de resultado do Autenticador é UM arquivo
+# só no servidor, compartilhado por todos os usuários daquela ferramenta web.
+# Consultar de minuto em minuto não só faz o painel pegar resultado alheio
+# como atropela a consulta de quem estiver usando a ferramenta do outro lado.
+# Garantia nova consulta na hora (ver _PEDIDO_STATUS_AUTENTICADOR), então o que este
+# intervalo controla é só o quanto o status envelhece na parede.
+INTERVALO_STATUS_AUTENTICADOR_SEG = 600
 _CONTRATOS_GARANTIA_PAINEL = []
 _TRAVA_CONTRATOS_PAINEL = threading.Lock()
 _PEDIDO_STATUS_AUTENTICADOR = threading.Event()
@@ -2616,6 +2622,138 @@ def consultar_dbm_onu_provedor(contrato, _tentativa=1):
 # FUNÇÕES DO AUTENTICADOR
 # =========================================
 
+ESPERA_MAX_CSV_AUTENTICADOR_SEG = 5
+INTERVALO_LEITURA_CSV_AUTENTICADOR_SEG = 0.8
+TENTATIVAS_CONSULTA_AUTENTICADOR = 3
+
+
+def _ler_tabela_autenticador(sessao):
+    """Uma leitura do CSV do Autenticador, já normalizada. Devolve (df, erro)."""
+    res = sessao.get(AUTENTICADOR_URL_LER_CSV, verify=False, timeout=(5, 35))
+    html_resp = res.text
+
+    if '<table>' not in html_resp:
+        return None, "Resposta do servidor não contém tabela (verifique se a VPN está conectada)."
+
+    try:
+        tabelas = pd.read_html(io.StringIO(html_resp))
+    except ImportError as e:
+        return None, f"Biblioteca de parse HTML ausente (ex: lxml): {e}"
+    except ValueError:
+        # tabela presente mas ainda sem linha nenhuma: o processamento não
+        # terminou de escrever. Não é erro, é "espere mais um pouco".
+        return None, None
+
+    if not tabelas:
+        return None, None
+
+    df = tabelas[0]
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    col_map = {
+        'contrato': 'CONTRATO', 'username': 'USERNAME', 'acctstarttime': 'INÍCIO',
+        'acctstoptime': 'FIM', 'circuitid': 'CIRCUITO', 'callingstationid': 'MAC',
+        'trafego': 'TRÁFEGO', 'servidor': 'SERVIDOR'
+    }
+    df.rename(columns=col_map, inplace=True)
+    for col in ['CONTRATO', 'USERNAME', 'INÍCIO', 'FIM', 'CIRCUITO', 'MAC', 'TRÁFEGO', 'SERVIDOR']:
+        if col not in df.columns:
+            df[col] = ''
+
+    df['CONTRATO'] = df['CONTRATO'].apply(
+        lambda x: str(int(x)) if pd.notna(x) and str(x).replace('.0', '').isdigit() else str(x)
+    )
+    return df, None
+
+
+def _esperar_csv_autenticador(sessao, lista_contratos):
+    """Uma tentativa: espera o CSV virar o resultado DESTA consulta.
+
+    Devolve (df, erro, refazer). `refazer=True` significa que o arquivo está
+    com resultado de outra pessoa -- reler não adianta, é preciso refazer o
+    pedido.
+    """
+    pedidos = {str(c).strip() for c in lista_contratos}
+    limite = time.time() + ESPERA_MAX_CSV_AUTENTICADOR_SEG
+    ultima_assinatura = None
+    ultimo_df = None
+    erro_ultimo = None
+
+    while True:
+        df, erro = _ler_tabela_autenticador(sessao)
+        if erro:
+            erro_ultimo = erro
+        elif df is not None:
+            encontrados = {str(c).strip() for c in df['CONTRATO'].tolist()}
+            intrusos = encontrados - pedidos
+
+            if intrusos:
+                # Contrato que ninguém aqui pediu só pode ter vindo de outra
+                # consulta: o arquivo do servidor é global. Nosso pedido foi
+                # atropelado, e insistir na leitura não traz ele de volta.
+                return None, None, True
+
+            if pedidos.issubset(encontrados):
+                return df, None, False       # tudo que foi pedido já está lá
+
+            # Tabela VAZIA não é resposta: é o instante em que o servidor está
+            # reescrevendo o arquivo. Guardá-la como resultado aceitável fazia
+            # a retentativa ser engolida e todo contrato virar NÃO LOCALIZADO.
+            if encontrados:
+                ultimo_df = df
+                assinatura = (len(df), tuple(sorted(encontrados)))
+                if assinatura == ultima_assinatura:
+                    return df, None, False   # estabilizou faltando alguém
+                ultima_assinatura = assinatura
+
+        if time.time() >= limite:
+            break
+        time.sleep(INTERVALO_LEITURA_CSV_AUTENTICADOR_SEG)
+
+    return ultimo_df, erro_ultimo, ultimo_df is None
+
+
+def _consultar_autenticador_com_retentativa(sessao, lista_contratos):
+    """Faz o ciclo pedir->processar->ler, repetindo quando o resultado é de
+    outra pessoa.
+
+    O CSV de resultado do Autenticador é UM arquivo só no servidor, compartilhado
+    por todos os usuários daquela ferramenta. Quando alguém dispara uma
+    consulta grande, ela sobrescreve a nossa: a leitura devolve centenas de
+    contratos que não pedimos e, logo depois, um arquivo vazio enquanto está
+    sendo reescrito. Sem tratar isso, todo contrato "some" e vira NÃO
+    LOCALIZADO -- indistinguível de cliente sem sessão. É a causa do status
+    oscilar entre ONLINE e NÃO LOCALIZADO sem nada mudar na rede.
+
+    Reler não resolve, porque o pedido em si foi atropelado. O que resolve é
+    refazer o ciclo inteiro.
+    """
+    payload = {"contratos": "\n".join(lista_contratos)}
+    erro_ultimo = None
+
+    for tentativa in range(1, TENTATIVAS_CONSULTA_AUTENTICADOR + 1):
+        sessao.post(AUTENTICADOR_URL_SAVE, data=payload, verify=False, timeout=(5, 35))
+        sessao.get(AUTENTICADOR_URL_PROCESSA, verify=False, timeout=(5, 35))
+
+        df, erro, refazer = _esperar_csv_autenticador(sessao, lista_contratos)
+        if erro:
+            erro_ultimo = erro
+        if not refazer and df is not None:
+            return df, None
+        if tentativa < TENTATIVAS_CONSULTA_AUTENTICADOR:
+            logger.info(
+                f"Autenticador: resultado da consulta veio de outra origem "
+                f"(tentativa {tentativa}/{TENTATIVAS_CONSULTA_AUTENTICADOR}); refazendo o pedido."
+            )
+            time.sleep(1.5)
+
+    logger.warning(
+        f"Autenticador: {TENTATIVAS_CONSULTA_AUTENTICADOR} tentativas e o resultado continuou "
+        "sendo sobrescrito por outra consulta."
+    )
+    return None, erro_ultimo or "O Autenticador não devolveu o resultado desta consulta."
+
+
 def consultar_autenticador_status(lista_contratos):
     """
     Consulta o status das sessões (online/offline) dos contratos informados
@@ -2626,38 +2764,9 @@ def consultar_autenticador_status(lista_contratos):
 
     try:
         sessao = requests.Session()
-        payload = {"contratos": "\n".join(lista_contratos)}
-
-        sessao.post(AUTENTICADOR_URL_SAVE, data=payload, verify=False, timeout=(5, 35))
-        sessao.get(AUTENTICADOR_URL_PROCESSA, verify=False, timeout=(5, 35))
-        res = sessao.get(AUTENTICADOR_URL_LER_CSV, verify=False, timeout=(5, 35))
-        html_resp = res.text
-
-        if '<table>' not in html_resp:
-            return pd.DataFrame(), "Resposta do servidor não contém tabela (verifique se a VPN está conectada)."
-
-        try:
-            tabelas = pd.read_html(io.StringIO(html_resp))
-        except ImportError as e:
-            return pd.DataFrame(), f"Biblioteca de parse HTML ausente (ex: lxml): {e}"
-
-        if not tabelas:
-            return pd.DataFrame(), "Nenhuma tabela encontrada na resposta do Autenticador."
-
-        df = tabelas[0]
-        df.columns = [c.lower().strip() for c in df.columns]
-
-        col_map = {
-            'contrato': 'CONTRATO', 'username': 'USERNAME', 'acctstarttime': 'INÍCIO',
-            'acctstoptime': 'FIM', 'circuitid': 'CIRCUITO', 'callingstationid': 'MAC',
-            'trafego': 'TRÁFEGO', 'servidor': 'SERVIDOR'
-        }
-        df.rename(columns=col_map, inplace=True)
-        for col in ['CONTRATO', 'USERNAME', 'INÍCIO', 'FIM', 'CIRCUITO', 'MAC', 'TRÁFEGO', 'SERVIDOR']:
-            if col not in df.columns:
-                df[col] = ''
-
-        df['CONTRATO'] = df['CONTRATO'].apply(lambda x: str(int(x)) if pd.notna(x) and str(x).replace('.0', '').isdigit() else str(x))
+        df, erro = _consultar_autenticador_com_retentativa(sessao, lista_contratos)
+        if erro or df is None:
+            return pd.DataFrame(), erro or "O Autenticador não devolveu resultado."
 
         status_contratos = {}
         for contrato in lista_contratos:
@@ -4511,8 +4620,19 @@ def thread_status_autenticador_painel():
         except Exception:
             logger.exception("Falha na thread de status do painel de TV.")
 
+        # O intervalo longo é a cadência de quem está SAUDÁVEL: o status na
+        # parede pode envelhecer 10 min sem prejuízo. Depois de uma falha,
+        # esperar tudo isso deixaria o painel em "VERIFICANDO" por 10 minutos
+        # por causa de uma disputa que costuma durar segundos -- então a
+        # próxima tentativa vem bem antes, afastando-se a cada falha seguida
+        # para não virar insistência contra um servidor ocupado.
+        if falhas_seguidas:
+            espera = min(INTERVALO_STATUS_AUTENTICADOR_SEG, 90 * falhas_seguidas)
+        else:
+            espera = INTERVALO_STATUS_AUTENTICADOR_SEG
+
         # acorda antes da hora quando entra garantia nova (ver _processar_fila)
-        _PEDIDO_STATUS_AUTENTICADOR.wait(timeout=INTERVALO_STATUS_AUTENTICADOR_SEG)
+        _PEDIDO_STATUS_AUTENTICADOR.wait(timeout=espera)
         _PEDIDO_STATUS_AUTENTICADOR.clear()
 
 
