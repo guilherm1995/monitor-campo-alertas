@@ -52,6 +52,54 @@ O lock é por arquivo, e funciona igual no Windows (`msvcrt`) e no Linux (`fcntl
 processo se recicla por tempo e por RAM livre da máquina, em janela de baixa
 atividade, em vez de esperar o travamento.
 
+## O painel de TV
+
+A tela da sala é Tkinter puro, em 1366×768, ampliado para 1080p pela TV. Sem
+navegador e sem framework: é o mesmo processo que faz o scraping, o que evita
+uma segunda aplicação para manter viva. Em troca vêm limitações reais — o
+Canvas do Tk não tem canal alfa, não arredonda canto e não suaviza forma
+nenhuma — e o desenho é construído em cima delas.
+
+**Formas desenhadas fora do Tk.** Cada card é uma imagem gerada com Pillow em
+3× e reduzida com LANCZOS; é daí que vem o canto arredondado limpo. Nenhum
+traço de 1px é desenhado pelo Tk: numa tela que ainda vai ser ampliada, régua
+fina sai dura e tremida, então a separação entre superfícies é por contraste
+de cor, não por borda.
+
+**Fade sem alfa.** A entrada de um item interpola todas as cores a partir da
+cor de fundo — texto, borda e acento — o que dá o efeito de materializar sem
+precisar de transparência. Os quadros do fade são pré-gerados no arranque, uma
+imagem por tique do laço, para o primeiro evento do dia não pagar a conta de
+renderizar tudo no meio da animação.
+
+**A chegada tem peso.** O card abre em ease-out empurrando a lista, e o
+conteúdo entra deslizando e assenta com uma ultrapassagem curta
+(ease-out-back). A ultrapassagem fica só no conteúdo, nunca na altura: altura
+que passa do ponto faz a lista inteira dar um solavanco.
+
+**Altura derivada do espaço real.** O card é dimensionado pelo número máximo de
+itens da coluna, não pelos que estão em tela. Assim a lista cheia ocupa a tela
+exata, e nenhum card muda de tamanho quando chega um item novo —
+redimensionar todo mundo a cada evento atropelaria a animação de chegada.
+
+**Consulta lenta fora do laço gráfico.** O status de conexão de cada cliente
+vem de uma consulta que leva dezenas de segundos e depende da VPN. Ela roda em
+thread própria e entrega por fila; o laço do Tk só consome. Duas falhas
+seguidas viram "SEM DADOS" em vez de deixar na tela um status velho, que
+engana quem olha de longe.
+
+**Alerta que dá para ler.** A versão anterior pintava a tela inteira de
+vermelho e piscava ligando e desligando a cor: chamava atenção e não deixava
+ler nada. Hoje pulsa só a moldura, por interpolação — de longe chama igual, e
+de perto o miolo continua escuro, com os dados em blocos grandes e uma barra
+mostrando quanto falta para o alerta sair sozinho.
+
+**Fonte resolvida em tempo de execução.** O código pedia uma fonte que só
+existe no Windows; no Linux o Tk caía num substituto silencioso. Agora a
+família é escolhida entre as que a máquina realmente tem, e os tamanhos são
+declarados em pixel — em ponto, o mesmo número muda de tamanho conforme o DPI
+da tela.
+
 ## Porte para Linux
 
 A pasta `deploy/linux/` tem o que faz isso rodar como serviço de verdade:

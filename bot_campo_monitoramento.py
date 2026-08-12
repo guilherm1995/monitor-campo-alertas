@@ -12,6 +12,7 @@ if "--render-backlog" in sys.argv:
 
 import os
 import json
+import math
 import time
 import random
 import logging
@@ -20,7 +21,6 @@ import re
 import unicodedata
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk
 import html
 import threading
 import queue
@@ -82,7 +82,10 @@ except ImportError:
     _WINSOUND_DISPONIVEL = False
 
 try:
-    from PIL import Image, ImageTk
+    # ImageDraw entra pelo Painel de TV: os cards são desenhados em resolução
+    # maior e reduzidos, que é como se consegue canto arredondado suavizado
+    # (o Canvas do Tk não faz antialiasing em forma nenhuma).
+    from PIL import Image, ImageDraw, ImageTk
     _PIL_DISPONIVEL = True
 except ImportError:
     _PIL_DISPONIVEL = False
@@ -478,27 +481,45 @@ ARQUIVO_DIAGNOSTICO_FILAS = os.path.join(PASTA_DADOS, "diagnostico_filas.json")
 TAMANHO_MAX_DIAGNOSTICO_ERRO = 500 * 1024
 
 # ============== PAINEL DE TV ==============
-COR_FUNDO = "#081B3A"
-COR_SIDEBAR = "#06152E"
-COR_CARD = "#102B57"
-COR_CARD_ESCURO = "#0A1931"
-COR_LINHA = "#16376B"
-COR_DESTAQUE = "#00BFFF"
-COR_AZUL_BOTAO = "#007BFF"
-COR_VERDE = "#00FF88"
-COR_ALERTA = "#C10037"
-COR_ALERTA_ESCURO = "#900028"
-COR_TEXTO = "#FFFFFF"
-COR_TEXTO_MUTED = "#AAAAAA"
+# Paleta espelhada de site/web/static/estilo.css (grafite neutro com índigo
+# como único acento). Tk não conhece alfa, então o que no CSS é rgba(...) já
+# entra aqui achatado sobre o fundo correspondente.
+COR_FUNDO        = "#0B0C10"   # --fundo
+COR_SUPERFICIE   = "#101116"   # topo: um degrau acima do fundo, sem borda
+COR_CARD         = "#16171D"   # --carta
+COR_BORDA        = "#26272D"   # --borda achatada sobre a carta
+COR_TEXTO        = "#F5F5F7"   # --texto
+COR_TEXTO_MUTED  = "#8B8F98"   # --texto-fraco
+COR_ROXO         = "#5E6AD2"   # --roxo
+COR_ROXO_CLARO   = "#8B93E0"   # --roxo-claro
+COR_DESTAQUE     = "#00BFFF"   # --ciano (acento da coluna de CAPEX)
+COR_VERDE        = "#00FF88"   # --verde
+COR_VERMELHO     = "#FF4D4D"   # --vermelho (acento da coluna de garantias)
+COR_LARANJA      = "#FFA500"   # --laranja
 
-MAX_ITENS_CAPEX = 7      # cards de CAPEX são mais compactos (2 linhas) -> cabem mais na tela
-MAX_ITENS_GARANTIA = 5   # cards de garantia são mais altos (3 linhas, com técnico OFS) -> cabem menos
+# O alerta de garantia é alarme de sala: continua vermelho e pulsando, só que
+# em tons derivados do --vermelho do site em vez do carmim antigo.
+COR_ALERTA        = "#D63C3C"
+COR_ALERTA_ESCURO = "#8E2323"
+
+MAX_ITENS_CAPEX = 7      # cards de CAPEX são mais compactos (3 linhas) -> cabem mais na tela
+MAX_ITENS_GARANTIA = 5   # cards de garantia são mais altos (4 linhas, com técnico OFS) -> cabem menos
 DURACAO_ALERTA_MS = 120000
-INTERVALO_PISKAR_MS = 600
 
 FILA_EVENTOS_TV = queue.Queue()
 TV_ATIVA = False
 ARQUIVO_HISTORICO_PAINEL = os.path.join(PASTA_DADOS, "historico_painel.json")
+
+# --- status de conexão das garantias (consulta ao Autenticador) ---
+# O painel mostra se o cliente da garantia está ONLINE ou OFFLINE. A consulta
+# é lenta (chega a 35s) e depende da VPN, então roda numa thread à parte e
+# entrega o resultado por fila, igual ao clima.
+FILA_STATUS_AUTENTICADOR = queue.Queue()
+INTERVALO_STATUS_AUTENTICADOR_SEG = 90
+_CONTRATOS_GARANTIA_PAINEL = []
+_TRAVA_CONTRATOS_PAINEL = threading.Lock()
+_PEDIDO_STATUS_AUTENTICADOR = threading.Event()
+_THREADS_PAINEL_INICIADAS = False
 
 # ============== PREVISÃO DO TEMPO ==============
 CIDADE_CLIMA = "Caraguatatuba - SP"
@@ -762,6 +783,42 @@ def _tentar_confirmar_certificado_forticlient():
         logger.warning(f"Popup de certificado encontrado, mas falhou ao clicar em 'Sim': {e}")
 
     return True
+
+
+def _vpn_e_gerenciada_externamente():
+    """True quando não há FortiClient/win32gui para automatizar -- ou seja,
+    no Linux, onde a VPN é o vpn_sempre_ativa.py rodando como serviço
+    systemd (campo-vpn.service) separado do bot, falando openconnect direto.
+
+    Confirmado em 09/08/2026: a máquina Linux de produção NÃO tem o
+    FortiClient original instalado, só o openconnect -- então não existe
+    janela nenhuma para automatizar ali, e tentar seria sempre falhar.
+    """
+    return not _WIN32GUI_DISPONIVEL
+
+
+def lidar_com_queda_de_vpn():
+    """Ponto único que os dois lugares do laço principal chamam quando
+    `vpn_esta_conectada()` vira False. Decide COMO reagir, ao contrário do
+    antigo `reconectar_forticlient()` direto, que só sabia fazer uma coisa.
+
+    - Windows (FortiClient instalado): automatiza a janela do FortiClient,
+      exatamente como sempre foi -- comportamento 100% preservado.
+    - Linux (só openconnect): não tem GUI para clicar, e não precisa: o
+      campo-vpn.service já está tentando reconectar sozinho, em processo
+      separado, com o próprio backoff dele (ver vpn_sempre_ativa.py). Aqui
+      só logamos e devolvemos na hora -- quem chamou já dorme e testa
+      `vpn_esta_conectada()` de novo no próprio laço, então o "esperar" já
+      existe do lado de fora; não precisa duplicar aqui.
+    """
+    if _vpn_e_gerenciada_externamente():
+        logger.info(
+            "VPN fora do ar -- sem GUI para automatizar aqui (Linux). "
+            "Confiando no campo-vpn.service (vpn_sempre_ativa) para reconectar "
+            "sozinho; só aguardando."
+        )
+        return
+    reconectar_forticlient()
 
 
 def reconectar_forticlient():
@@ -1431,6 +1488,19 @@ def retomar_monitor():
 # pela thread de escuta e não conseguiria abrir janela.
 _painel_tv_pedido = threading.Event()
 _navegador_visivel = threading.Event()
+if os.environ.get('NAVEGADOR_VISIVEL_INICIAL') == '1':
+    # Diagnostico/depuracao: forca o navegador visivel desde o boot, sem
+    # precisar de comando no grupo (Telegram/WhatsApp) -- util quando esses
+    # canais ainda nao estao disponiveis (primeira instalacao, sem QR
+    # escaneado ainda) mas alguem precisa ver a tela, ex.: para digitar um
+    # codigo de autenticador no primeiro login do CAMPO numa maquina nova.
+    _navegador_visivel.set()
+if os.environ.get('PAINEL_TV_INICIAL') == '1':
+    # Producao (11/08/2026): o Painel de TV fica sempre ligado por padrao na
+    # TV fisica, sem precisar de /exibirpaineltv a cada boot/reinicio. O
+    # navegador do CAMPO continua oculto por padrao (default acima, sem env
+    # var) -- os dois estados sao independentes, como sempre foram.
+    _painel_tv_pedido.set()
 
 
 def painel_tv_pedido():
@@ -1808,27 +1878,61 @@ _MCI_ALIAS_ALERTA = "alerta_garantia_som"
 
 CAMINHO_LOGO_OPERACIONAL = os.path.join(base_dir, "assets", "logo_operacional.png")
 
+# O logo tem duas versões. A original (logo_operacional.png) tem a palavra escrita
+# em preto — serve para as imagens de fundo branco que o site gera, e some num
+# painel escuro. A do site (logo.png, aqui copiada como logo_operacional_branco.png)
+# é a versão branca, que é a certa para o Painel de TV. A lista é tentada em
+# ordem, então uma instalação sem o arquivo novo ainda cai na original.
+CAMINHOS_LOGO_PAINEL = [
+    os.path.join(base_dir, "assets", "logo_operacional_branco.png"),
+    os.path.join(base_dir, "assets", "logo_operacional.png"),
+]
+
 
 def tocar_som_alerta_garantia():
-    if not sys.platform.startswith('win'):
-        logger.warning("Reprodução de som de alerta só implementada para Windows.")
-        return
+    """Toca o som de alerta na máquina local -- pensado para o Painel de TV
+    (a TV física de produção tem caixa de som ligada nela; o alerta sonoro
+    do site, via navegador, é uma coisa separada e continua funcionando
+    independente disto)."""
     if not os.path.exists(SOM_ALERTA_GARANTIA):
         logger.warning(f"Arquivo de som '{os.path.basename(SOM_ALERTA_GARANTIA)}' não encontrado.")
         return
 
-    def _tocar():
-        try:
-            import ctypes
-            winmm = ctypes.windll.winmm
-            winmm.mciSendStringW(f'close {_MCI_ALIAS_ALERTA}', None, 0, None)
-            winmm.mciSendStringW(
-                f'open "{SOM_ALERTA_GARANTIA}" type mpegvideo alias {_MCI_ALIAS_ALERTA}',
-                None, 0, None
-            )
-            winmm.mciSendStringW(f'play {_MCI_ALIAS_ALERTA}', None, 0, None)
-        except Exception as e:
-            logger.error(f"Falha ao tocar som de alerta de garantia: {e}")
+    if sys.platform.startswith('win'):
+        def _tocar():
+            try:
+                import ctypes
+                winmm = ctypes.windll.winmm
+                winmm.mciSendStringW(f'close {_MCI_ALIAS_ALERTA}', None, 0, None)
+                winmm.mciSendStringW(
+                    f'open "{SOM_ALERTA_GARANTIA}" type mpegvideo alias {_MCI_ALIAS_ALERTA}',
+                    None, 0, None
+                )
+                winmm.mciSendStringW(f'play {_MCI_ALIAS_ALERTA}', None, 0, None)
+            except Exception as e:
+                logger.error(f"Falha ao tocar som de alerta de garantia: {e}")
+    else:
+        # mpg123 troca o winmm/MCI do Windows -- toca o mp3 direto no sink de
+        # audio padrão (ALSA/Pulse/Pipewire, o que estiver rodando na
+        # máquina). "-q" só tira o textão de progresso do mpg123 do log.
+        import shutil
+        mpg123 = shutil.which("mpg123")
+
+        def _tocar():
+            if not mpg123:
+                logger.warning(
+                    "mpg123 não encontrado no PATH -- instale com "
+                    "'sudo apt install mpg123' para o alerta sonoro funcionar."
+                )
+                return
+            try:
+                subprocess.run(
+                    [mpg123, "-q", SOM_ALERTA_GARANTIA],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=30,
+                )
+            except Exception as e:
+                logger.error(f"Falha ao tocar som de alerta de garantia: {e}")
 
     threading.Thread(target=_tocar, daemon=True).start()
 
@@ -2879,6 +2983,18 @@ def iniciar_vpn_sempre_ativa():
         logger.info("Autostart da VPN desativado (VPN_AUTOSTART=0).")
         return
 
+    if _vpn_e_gerenciada_externamente():
+        # Linux: o campo-vpn.service já sobe o vpn_sempre_ativa.py como root,
+        # em processo separado, antes do bot iniciar (ver instalar.sh/systemd).
+        # Se o bot também tentasse subir aqui, ia rodar como o usuário sem
+        # privilégio 'operacional' -- o próprio vpn_sempre_ativa.py recusa de
+        # propósito (precisa de root) e só gera log de erro à toa.
+        logger.info(
+            "VPN gerenciada externamente (campo-vpn.service) -- pulando "
+            "autostart pelo bot."
+        )
+        return
+
     # Quando o bot está rodando como .exe empacotado (PyInstaller), sys.executable
     # é o PRÓPRIO bot_campo_monitoramento.exe -- rodar "[sys.executable, vpn_sempre_ativa.py]"
     # nesse caso só abriria outra instância do bot, não o script da VPN (que precisa de
@@ -2943,23 +3059,6 @@ try:
     WHATSAPP_ALERTA_PORTA = _urlsplit(WHATSAPP_ALERTA_URL).port or 3939
 except Exception:
     WHATSAPP_ALERTA_PORTA = 3939
-
-
-# --- Vigia do serviço Node (ponte HTTP do WhatsApp) ---
-# De quanto em quanto o vigia bate em /status. 20s dá detecção em ~1 min sem
-# ficar martelando a ponte.
-INTERVALO_VIGIA_WHATSAPP_SEG = 20
-# Carência depois de (re)subir o Node, antes de a checagem valer. O Baileys leva
-# alguns segundos para abrir a porta; 45s cobre com folga. O trava de 09/08 NÃO
-# abriu a porta nem em 1h50, então esta carência não mascara um travamento real.
-CARENCIA_ARRANQUE_WHATSAPP_SEG = 45
-# Quantas checagens seguidas sem /status para dar a ponte por morta e relançar.
-# 3 x 20s = ~1 min de fora do ar confirmado, longe do transitório de uma
-# reconexão do Baileys (que nem derruba a ponte).
-FALHAS_ATE_REINICIAR_WHATSAPP = 3
-# Depois de tantos relançamentos sem sucesso, avisa UMA vez no Telegram. Silêncio
-# aqui repetiria o buraco de 09/08 por outro caminho.
-MAX_RELANCAMENTOS_WHATSAPP_ANTES_ALERTA = 3
 
 
 def _porta_whatsapp_ocupada():
@@ -3078,111 +3177,6 @@ def iniciar_servico_alerta_whatsapp():
     STATUS_SERVICO_WHATSAPP["processo"] = processo
     threading.Thread(target=_ler_log_processo_whatsapp, args=(processo,), daemon=True).start()
     logger.info(f"Serviço de alerta WhatsApp iniciado (PID {processo.pid}).")
-
-
-def _encerrar_processo_whatsapp():
-    """Mata o Node do WhatsApp que este bot subiu, antes de relançar outro.
-
-    Necessário porque o travamento de 09/08 deixou o processo VIVO sem abrir a
-    porta -- `_esperar_porta_whatsapp_livre` sozinho não o remove (ele não segura
-    a porta) e um simples relançamento vazaria um Node zumbi por tentativa.
-    """
-    proc = STATUS_SERVICO_WHATSAPP.get("processo")
-    if proc is None:
-        return
-    try:
-        if proc.poll() is None:          # ainda vivo
-            proc.terminate()
-            try:
-                proc.wait(timeout=8)
-            except Exception:
-                proc.kill()
-    except Exception as e:
-        logger.warning(f"Falha ao encerrar o Node do WhatsApp antes de relançar: {e}")
-    finally:
-        STATUS_SERVICO_WHATSAPP["conectado"] = False
-        STATUS_SERVICO_WHATSAPP["processo"] = None
-
-
-def thread_vigia_servico_whatsapp():
-    """Relança o serviço Node do WhatsApp se a ponte HTTP parar de responder.
-
-    Cuida SÓ da ponte HTTP (porta respondendo /status). A reconexão da sessão do
-    WhatsApp o próprio Baileys já faz sozinho -- um 428 rotineiro derruba
-    `conectado` mas a ponte segue no ar (`servidor.listen` no index.js é
-    independente da conexão), então isso NÃO é motivo de relançar. Usar /status
-    em vez do estado "conectado" é justamente o que evita reinício falso a cada
-    reconexão normal.
-
-    O buraco que isto tapa é outro: em 09/08/2026 um reinício por RAM subiu um
-    Node que travou no arranque e NUNCA abriu a porta -- processo vivo, ponte
-    muda, e o bot passou ~1h50 gravando "serviço Node pode estar offline" a cada
-    3s sem ninguém agir, porque o processo estar VIVO não era o mesmo que a ponte
-    estar no ar. O Telegram não foi afetado (canal à parte).
-    """
-    if not (WHATSAPP_ALERTA_ATIVO and WHATSAPP_ALERTA_AUTOSTART):
-        return
-
-    logger.info(
-        "Vigia do serviço WhatsApp iniciado (relança o Node se a ponte HTTP "
-        f"ficar {FALHAS_ATE_REINICIAR_WHATSAPP} checagens sem responder /status)."
-    )
-    # O Node acabou de subir junto com o bot; dá o tempo de arranque antes de a
-    # primeira checagem valer.
-    time.sleep(CARENCIA_ARRANQUE_WHATSAPP_SEG)
-
-    falhas = 0
-    relancamentos = 0
-    alertou_persistente = False
-
-    while True:
-        time.sleep(INTERVALO_VIGIA_WHATSAPP_SEG)
-
-        if _servico_whatsapp_saudavel():
-            if falhas or relancamentos:
-                logger.info("Ponte do WhatsApp respondendo /status de novo.")
-            falhas = 0
-            relancamentos = 0
-            alertou_persistente = False
-            continue
-
-        falhas += 1
-        logger.warning(
-            f"Ponte do WhatsApp não respondeu /status -- checagem "
-            f"{falhas}/{FALHAS_ATE_REINICIAR_WHATSAPP}."
-        )
-        if falhas < FALHAS_ATE_REINICIAR_WHATSAPP:
-            continue
-
-        # Fora do ar confirmado. Mata o Node travado e sobe outro.
-        falhas = 0
-        relancamentos += 1
-        logger.warning(
-            f"Ponte do WhatsApp fora do ar. Relançando o serviço Node "
-            f"(tentativa {relancamentos})."
-        )
-        _encerrar_processo_whatsapp()
-        try:
-            iniciar_servico_alerta_whatsapp()
-        except Exception:
-            logger.exception("Falha ao relançar o serviço de alerta WhatsApp.")
-
-        # Mesmo tempo de arranque antes de voltar a cobrar.
-        time.sleep(CARENCIA_ARRANQUE_WHATSAPP_SEG)
-
-        # Insistiu várias vezes e não voltou: avisa UMA vez pelo Telegram, que é
-        # o canal que ainda funciona quando o WhatsApp está fora.
-        if (relancamentos >= MAX_RELANCAMENTOS_WHATSAPP_ANTES_ALERTA
-                and not alertou_persistente and not _servico_whatsapp_saudavel()):
-            alertou_persistente = True
-            try:
-                alerta_critico_telegram(
-                    f"🟠 Serviço de alerta do WhatsApp não sobe: {relancamentos} "
-                    "relançamentos sem a ponte responder. Os alertas do grupo "
-                    "estão saindo só pelo Telegram até isso voltar."
-                )
-            except Exception:
-                pass
 
 
 def enviar_alerta_telegram(mensagem, parse_mode=None):
@@ -3413,6 +3407,7 @@ def montar_mensagem_comandos(whatsapp=False):
         f"🌡️ *{barra}termometro* — termômetro de entrantes CAPEX",
         "📡 *​/autenticador* — consulta status de um contrato",
         "🖥️ *​/painel* — endereço e PIN do site do painel",
+        "🔄 *​/reiniciar* — reinicia a máquina inteira (VPN, bot, site, painel)",
     ]
     if whatsapp:
         linhas.append("📎 *​/improdutivas* — análise do relatório OFS (envie o CSV depois)")
@@ -3545,6 +3540,38 @@ def _obter_texto_comando(mensagem_telegram):
     return primeira_palavra.split('@')[0].lower()
 
 
+# ============ /reiniciar (reboot da máquina inteira) ============
+# Atraso antes do reboot de verdade: dá tempo do alerta sair pelo Telegram/
+# WhatsApp (HTTP) antes da máquina cair. Sem isso a mensagem "reiniciando..."
+# corre o risco de nunca sair.
+REINICIAR_ATRASO_SEG = 3
+_reiniciar_em_andamento = threading.Event()
+
+
+def _reiniciar_sistema_thread():
+    """Roda em thread separada para não travar o laço de escuta de comandos
+    enquanto espera o atraso. Reboot da MÁQUINA INTEIRA (não só os serviços) --
+    sudo com regra restrita (só 'systemctl reboot', nada mais) instalada pelo
+    instalar.sh, passo 2i. Só age em Linux: o bot também roda em dev/Windows,
+    onde este comando não deve fazer nada."""
+    try:
+        time.sleep(REINICIAR_ATRASO_SEG)
+        if not sys.platform.startswith('linux'):
+            logger.warning(
+                "/reiniciar pedido, mas a plataforma não é Linux -- ignorando "
+                "(o comando só reinicia a máquina de produção)."
+            )
+            return
+        logger.warning("Executando reinício completo do sistema (comando /reiniciar).")
+        subprocess.run(["sudo", "/usr/bin/systemctl", "reboot"], timeout=15, check=True)
+    except Exception:
+        logger.exception("Falha ao executar o reinício do sistema via /reiniciar.")
+    finally:
+        # Se o reboot realmente disparou, a máquina cai e isto nem chega a
+        # rodar -- só importa no caminho de falha, para permitir tentar de novo.
+        _reiniciar_em_andamento.clear()
+
+
 def escutar_comandos_telegram():
     logger.info("Thread de escuta de comandos do Telegram iniciada (aguardando '/status')...")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -3587,6 +3614,19 @@ def escutar_comandos_telegram():
                         enviar_alerta_telegram(montar_mensagem_comandos())
                     except Exception:
                         logger.exception("Falha ao enviar a lista de comandos.")
+                    continue
+
+                if comando == "/reiniciar":
+                    if _reiniciar_em_andamento.is_set():
+                        enviar_alerta_telegram("🔄 Já estou reiniciando o sistema — aguarde.")
+                    else:
+                        _reiniciar_em_andamento.set()
+                        logger.warning("Comando /reiniciar recebido no grupo (Telegram). Reiniciando o sistema.")
+                        enviar_alerta_telegram(
+                            "🔄 *Reiniciando o sistema todo.* VPN, bot, site e painel de TV "
+                            "voltam sozinhos em 1-2 minutos."
+                        )
+                        threading.Thread(target=_reiniciar_sistema_thread, daemon=True).start()
                     continue
 
                 if comando == "/status":
@@ -3835,6 +3875,19 @@ def escutar_comandos_whatsapp():
                         enviar_alerta_whatsapp_grupo(montar_mensagem_comandos(whatsapp=True))
                     except Exception:
                         logger.exception("Falha ao enviar a lista de comandos no WhatsApp.")
+                    continue
+
+                if comando == "/reiniciar":
+                    if _reiniciar_em_andamento.is_set():
+                        enviar_alerta_whatsapp_grupo("🔄 Já estou reiniciando o sistema — aguarde.")
+                    else:
+                        _reiniciar_em_andamento.set()
+                        logger.warning("Comando '/reiniciar' recebido no grupo do WhatsApp. Reiniciando o sistema.")
+                        enviar_alerta_whatsapp_grupo(
+                            "🔄 *Reiniciando o sistema todo.* VPN, bot, site e painel de TV "
+                            "voltam sozinhos em 1-2 minutos."
+                        )
+                        threading.Thread(target=_reiniciar_sistema_thread, daemon=True).start()
                     continue
 
                 if comando in ("/exibirpaineltv", "exibirpaineltv",
@@ -4098,73 +4151,979 @@ def refazer_login(pagina):
 # os comandos /exibirnavegador e /exibirpaineltv, em tempo de execução.
 
 
+# =========================================================================
+# PAINEL DE TV
+#
+# A tela da sala de operação, em Tkinter, dentro deste mesmo processo — não há
+# navegador nem segunda aplicação para manter viva. Roda em 1366x768, que a TV
+# amplia para 1080p, e a identidade visual acompanha a do site (grafite neutro
+# com índigo de acento, ver site/web/static/estilo.css).
+#
+# O Canvas do Tk não tem canal alfa, não arredonda canto e não suaviza forma
+# nenhuma. Três consequências que explicam quase todo o desenho daqui:
+#
+#   * forma é imagem: o fundo dos cards é gerado no PIL em 3x e reduzido, que é
+#     de onde vem o canto arredondado limpo;
+#   * traço fino não existe: numa tela que ainda vai ser ampliada, régua de 1px
+#     sai dura e tremida, então superfície se separa por contraste de cor;
+#   * transparência se imita: o fade interpola as cores a partir do fundo da
+#     tela, em vez de mexer em opacidade.
+# =========================================================================
+
+QUADROS_ENTRADA = 9          # passos do fade de entrada de um card
+_RAIO_CARD = 12
+_BARRA_X0, _BARRA_X1 = 8, 11  # trilho de acento à esquerda do card
+_MARGEM_TEXTO_ESQ = 26
+_MARGEM_TEXTO_DIR = 18
+ESPACO_ENTRE_CARDS = 9
+ALTURA_CABECALHO_SECAO = 32
+ALTURA_TOPO = 68
+
+ESTADOS_STATUS = {
+    "ONLINE":         (COR_VERDE, "ONLINE"),
+    "OFFLINE":        (COR_VERMELHO, "OFFLINE"),
+    "NÃO LOCALIZADO": (COR_LARANJA, "NÃO LOCALIZADO"),
+    "VERIFICANDO":    (COR_TEXTO_MUTED, "VERIFICANDO"),
+    "SEM DADOS":      (COR_TEXTO_MUTED, "SEM DADOS"),
+}
+
+
+# ------------------------------- cor -------------------------------------
+def _hex_para_rgb(cor):
+    cor = cor.lstrip("#")
+    return tuple(int(cor[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb_para_hex(rgb):
+    return "#%02X%02X%02X" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
+
+
+def misturar_cores(cor_origem, cor_destino, t):
+    """Interpola duas cores #RRGGBB. t=0 devolve a origem, t=1 o destino."""
+    t = max(0.0, min(1.0, t))
+    a = _hex_para_rgb(cor_origem)
+    b = _hex_para_rgb(cor_destino)
+    return _rgb_para_hex(tuple(a[i] + (b[i] - a[i]) * t for i in range(3)))
+
+
+# ------------------------------ fonte ------------------------------------
+_FAMILIAS_DISPONIVEIS = None
+
+
+def _familia_disponivel(*candidatas):
+    """Primeira família de fonte que existe de verdade nesta máquina.
+
+    A versão anterior pedia "Segoe UI" em tudo. No Linux do servidor essa
+    fonte não existe e o Tk caía num substituto silencioso. Resolvendo aqui,
+    o painel fica igual no Windows e no Ubuntu — e se um dia a Inter (a fonte
+    do site) for instalada, ele passa a usá-la sozinho.
+    """
+    global _FAMILIAS_DISPONIVEIS
+    if _FAMILIAS_DISPONIVEIS is None:
+        _FAMILIAS_DISPONIVEIS = {f.lower() for f in tkfont.families()}
+    for nome in candidatas:
+        if nome.lower() in _FAMILIAS_DISPONIVEIS:
+            return nome
+    return candidatas[-1]
+
+
+class FontesPainel:
+    """Tamanhos em PIXEL (size negativo) de propósito: em ponto, o mesmo
+    número muda de tamanho conforme o DPI da tela."""
+
+    def __init__(self):
+        ui = _familia_disponivel("Inter", "DejaVu Sans", "Liberation Sans", "Segoe UI")
+        mono = _familia_disponivel("JetBrains Mono", "DejaVu Sans Mono", "Consolas")
+
+        self.hora = tkfont.Font(family=mono, size=-13)
+        self.unidade = tkfont.Font(family=ui, size=-13, weight="bold")
+        self.contrato = tkfont.Font(family=ui, size=-14, weight="bold")
+        self.cliente = tkfont.Font(family=ui, size=-16, weight="bold")
+        self.meta = tkfont.Font(family=ui, size=-13)
+        self.rodape_card = tkfont.Font(family=ui, size=-13)
+        self.selo = tkfont.Font(family=ui, size=-12, weight="bold")
+        self.secao = tkfont.Font(family=ui, size=-14, weight="bold")
+        self.secao_contagem = tkfont.Font(family=ui, size=-13)
+        self.titulo_topo = tkfont.Font(family=ui, size=-14, weight="bold")
+        self.clima = tkfont.Font(family=ui, size=-14)
+        self.relogio = tkfont.Font(family=mono, size=-32, weight="bold")
+        self.data = tkfont.Font(family=ui, size=-13)
+        self.vazio = tkfont.Font(family=ui, size=-14)
+        self.alerta_etiqueta = tkfont.Font(family=ui, size=-24, weight="bold")
+        self.alerta_titulo = tkfont.Font(family=ui, size=-62, weight="bold")
+        self.alerta_rotulo = tkfont.Font(family=ui, size=-16, weight="bold")
+        self.alerta_valor = tkfont.Font(family=ui, size=-34, weight="bold")
+
+
+FONTES_PAINEL = None   # instanciado quando já existe um root Tk
+
+
+def encaixar_texto(texto, fonte, largura_max):
+    """Corta com reticências em vez de quebrar linha: num painel de TV a
+    altura do card é fixa, então texto que vaza tem que sumir, não empurrar."""
+    texto = "" if texto is None else str(texto)
+    if largura_max <= 0 or fonte.measure(texto) <= largura_max:
+        return texto
+    largura_util = largura_max - fonte.measure("…")
+    if largura_util <= 0:
+        return "…"
+    corte = texto
+    while corte and fonte.measure(corte) > largura_util:
+        corte = corte[:-1]
+    return corte.rstrip(" ·,|") + "…"
+
+
+def espacar_titulo(texto, separador=" "):
+    """Imita o letter-spacing dos rótulos maiúsculos do site (o Tk não tem)."""
+    return separador.join(texto)
+
+
+# ------------------------- formas desenhadas -----------------------------
+_cache_formas = {}
+
+
+def _reduzir_para_tk(img, largura, altura):
+    return ImageTk.PhotoImage(img.resize((largura, altura), Image.LANCZOS))
+
+
+def fundo_do_cartao(largura, altura, acento, passo=QUADROS_ENTRADA - 1):
+    """Fundo do card no passo `passo` do fade (o último é o estado final).
+
+    O fade sai da cor do fundo da tela e vai até as cores finais, o que faz o
+    card materializar sem precisar de canal alfa — que o Tk não tem.
+    """
+    if not _PIL_DISPONIVEL:
+        return None
+
+    largura = max(40, int(largura))
+    altura = max(20, int(altura))
+    chave = ("card", largura, altura, acento, passo)
+    if chave in _cache_formas:
+        return _cache_formas[chave]
+
+    t = passo / float(QUADROS_ENTRADA - 1)
+    esc = 3  # desenha em 3x e reduz: é daí que vem o antialiasing
+    img = Image.new("RGB", (largura * esc, altura * esc), COR_FUNDO)
+    desenho = ImageDraw.Draw(img)
+
+    desenho.rounded_rectangle(
+        [0, 0, largura * esc - 1, altura * esc - 1],
+        autenticador=_RAIO_CARD * esc,
+        fill=misturar_cores(COR_FUNDO, COR_CARD, t),
+        outline=misturar_cores(COR_FUNDO, COR_BORDA, t),
+        width=esc,
+    )
+
+    margem = max(12, int(altura * 0.17))
+    desenho.rounded_rectangle(
+        [_BARRA_X0 * esc, margem * esc, _BARRA_X1 * esc, (altura - margem) * esc],
+        autenticador=int(1.5 * esc),
+        fill=misturar_cores(COR_FUNDO, acento, t),
+    )
+
+    imagem = _reduzir_para_tk(img, largura, altura)
+    _cache_formas[chave] = imagem
+    return imagem
+
+
+def pilula_marcador(largura, altura, cor, fundo=COR_FUNDO):
+    """Marcador arredondado dos cabeçalhos de seção."""
+    if not _PIL_DISPONIVEL:
+        return None
+    chave = ("pilula", largura, altura, cor, fundo)
+    if chave in _cache_formas:
+        return _cache_formas[chave]
+
+    esc = 4
+    img = Image.new("RGB", (largura * esc, altura * esc), fundo)
+    ImageDraw.Draw(img).rounded_rectangle(
+        [0, 0, largura * esc - 1, altura * esc - 1],
+        autenticador=int(largura * esc / 2), fill=cor
+    )
+    imagem = _reduzir_para_tk(img, largura, altura)
+    _cache_formas[chave] = imagem
+    return imagem
+
+
+def limpar_cache_formas():
+    _cache_formas.clear()
+
+
+# ---------------------- status de conexão (Autenticador) -----------------------
+def registrar_contratos_painel(contratos):
+    """O painel publica aqui os contratos que estão em tela; a thread do
+    Autenticador lê daqui. Lista curta (no máximo MAX_ITENS_GARANTIA)."""
+    with _TRAVA_CONTRATOS_PAINEL:
+        _CONTRATOS_GARANTIA_PAINEL[:] = list(contratos)
+
+
+def _contratos_painel_atuais():
+    with _TRAVA_CONTRATOS_PAINEL:
+        return list(_CONTRATOS_GARANTIA_PAINEL)
+
+
+def thread_status_autenticador_painel():
+    """Mantém o ONLINE/OFFLINE dos cards de garantia em dia.
+
+    Roda solta porque a consulta ao Autenticador é lenta (até 35s de timeout) e
+    depende da VPN — dentro do laço do Tk isso congelaria o relógio e a
+    animação. O resultado volta pela FILA_STATUS_AUTENTICADOR.
+    """
+    falhas_seguidas = 0
+    while True:
+        try:
+            contratos = _contratos_painel_atuais()
+            if contratos:
+                df, erro = consultar_autenticador_status(contratos)
+
+                if erro or df is None or df.empty:
+                    falhas_seguidas += 1
+                    logger.warning(
+                        f"Status do painel: Autenticador não respondeu ({erro or 'sem linhas'}). "
+                        f"Falha {falhas_seguidas}."
+                    )
+                    # uma falha isolada não apaga o que está na tela; a
+                    # segunda seguida, sim — status velho engana quem olha
+                    if falhas_seguidas >= 2:
+                        FILA_STATUS_AUTENTICADOR.put({
+                            "status": {c: "SEM DADOS" for c in contratos},
+                            "rodape": f"Autenticador · sem resposta {datetime.now():%H:%M}",
+                        })
+                else:
+                    falhas_seguidas = 0
+                    status = {}
+                    for _, linha in df.iterrows():
+                        contrato = str(linha.get("CONTRATO") or "").strip()
+                        if contrato:
+                            status[contrato] = str(linha.get("STATUS") or "").strip().upper()
+                    FILA_STATUS_AUTENTICADOR.put({
+                        "status": status,
+                        "rodape": f"Autenticador · {datetime.now():%H:%M}",
+                    })
+        except Exception:
+            logger.exception("Falha na thread de status do painel de TV.")
+
+        # acorda antes da hora quando entra garantia nova (ver _processar_fila)
+        _PEDIDO_STATUS_AUTENTICADOR.wait(timeout=INTERVALO_STATUS_AUTENTICADOR_SEG)
+        _PEDIDO_STATUS_AUTENTICADOR.clear()
+
+
+# ------------------------------- card ------------------------------------
+class Cartao(tk.Canvas):
+    """Um item da lista.
+
+    É um Canvas e não um Frame com Labels porque assim dá para arredondar o
+    canto, posicionar ao pixel e animar a entrada mexendo em cor e posição
+    dos itens, sem criar nem destruir widget nenhum durante a animação.
+    """
+
+    # Três coisas acontecem juntas para o card PARECER que chegou, e não que
+    # simplesmente apareceu:
+    #   1. a altura abre em ease-out e empurra a lista para baixo;
+    #   2. o conteúdo entra deslizando de cima e ASSENTA com uma ultrapassagem
+    #      curta (ease-out-back) — é isso que dá peso à chegada;
+    #   3. as cores sobem do fundo até o valor final.
+    # A ultrapassagem fica só no conteúdo, nunca na altura: se a altura
+    # passasse do ponto, a lista inteira daria um solavanco.
+    DURACAO_ENTRADA = 0.6
+    DESLOCAMENTO_INICIAL = 0.5      # fração da altura em que o conteúdo começa
+
+    def __init__(self, master, altura, acento, evento, com_status=False):
+        # A largura pedida é só um mínimo simbólico: quem decide de verdade é
+        # o grid da coluna (o canvas estica com sticky="ew"). Se o canvas
+        # pedisse a largura "certa", esse pedido viraria largura MÍNIMA da
+        # coluna e as duas colunas juntas estourariam a tela.
+        #
+        # Não pode ser 1: um widget de 1px acrescentado a um container que já
+        # foi realizado o Tk simplesmente não mapeia — fica invisível para
+        # sempre. 80 é pequeno o bastante para não empurrar a coluna e grande
+        # o bastante para o Tk levar a sério.
+        super().__init__(
+            master, width=80, height=altura,
+            bg=COR_FUNDO, highlightthickness=0, bd=0, takefocus=0
+        )
+        self.largura = 0
+        self.altura = altura
+        self.acento = acento
+        self.evento = evento
+        self.com_status = com_status
+
+        self._itens_texto = []      # [(id, cor_final)]
+        self._id_fundo = None
+        self._ref_fundo = None
+        self._job_animacao = None
+        self._job_selo = None
+        self._passo_atual = QUADROS_ENTRADA - 1
+        self._status = "VERIFICANDO"
+        self._id_status_ponto = None
+        self._id_status_texto = None
+        self._id_selo_novo = None
+        self._y_linha1 = 20
+        self._pendente_novo = False
+        self._duracao_selo = 30000
+        self._deslocamento = 0.0
+
+        self.bind("<Configure>", self._ao_redimensionar)
+
+    # ---------------- largura ----------------
+    def _ao_redimensionar(self, evento):
+        # a animação de entrada mexe na altura e dispara <Configure> a cada
+        # quadro; só a mudança de LARGURA obriga a redesenhar
+        if evento.width == self.largura:
+            return
+        self._redesenhar_com_largura(evento.width)
+
+    def garantir_desenho(self):
+        """Desenha já, sem depender de o <Configure> chegar pela fila de
+        eventos. Quem chama roda um update_idletasks antes, então o
+        winfo_width() aqui já é a largura final que o grid deu."""
+        self._redesenhar_com_largura(self.winfo_width())
+
+    def _redesenhar_com_largura(self, largura):
+        if largura == self.largura or largura < 100:
+            return
+        self.largura = largura
+        self._desenhar()
+        if self._pendente_novo and self._id_selo_novo is None and not self._job_animacao:
+            self._desenhar_selo_novo()
+        if self._passo_atual < QUADROS_ENTRADA - 1:
+            self._aplicar_passo(self._passo_atual)
+
+    # ---------------- desenho ----------------
+    def _texto(self, x, y, texto, fonte, cor, ancora="w"):
+        item = self.create_text(x, y, text=texto, font=fonte, fill=cor, anchor=ancora)
+        self._itens_texto.append((item, cor))
+        return item
+
+    def _largura_texto(self, item):
+        caixa = self.bbox(item)
+        return 0 if not caixa else caixa[2] - caixa[0]
+
+    def _desenhar(self):
+        self.delete("all")
+        self._itens_texto = []
+        self._id_status_texto = None
+        self._id_status_ponto = None
+        self._id_selo_novo = None
+        self._deslocamento = 0.0   # os itens voltam para a posição de base
+        if self.largura < 60:
+            return                 # ainda não recebeu largura do grid
+
+        self._ref_fundo = fundo_do_cartao(self.largura, self.altura, self.acento)
+        if self._ref_fundo is not None:
+            self._id_fundo = self.create_image(0, 0, image=self._ref_fundo, anchor="nw")
+        else:  # sem Pillow: retângulo chapado, feio mas funciona
+            self._id_fundo = self.create_rectangle(
+                0, 0, self.largura - 1, self.altura - 1,
+                fill=COR_CARD, outline=COR_BORDA
+            )
+
+        ev = self.evento
+        limite_dir = self.largura - _MARGEM_TEXTO_DIR
+
+        # O bloco de texto é centralizado na vertical: assim o card pode
+        # esticar para ocupar a tela toda sem deixar o conteúdo encostado
+        # na borda de cima.
+        linhas = 4 if self.com_status else 3
+        espaco = max(20, min(30, (self.altura - 36) // (linhas - 1)))
+        y = (self.altura - espaco * (linhas - 1)) // 2
+        self._y_linha1 = y
+
+        # linha 1: hora · unidade · contrato
+        x = _MARGEM_TEXTO_ESQ
+        item = self._texto(x, y, ev.get("timestamp", "--:--:--"),
+                           FONTES_PAINEL.hora, COR_TEXTO_MUTED)
+        x += self._largura_texto(item) + 12
+
+        item = self._texto(x, y, str(ev.get("unidade", "N/D")).upper(),
+                           FONTES_PAINEL.unidade, self.acento)
+        x += self._largura_texto(item) + 12
+
+        self._texto(x, y, f"Contrato {ev.get('contrato', 'N/D')}",
+                    FONTES_PAINEL.contrato, COR_TEXTO)
+
+        if self.com_status:
+            self._desenhar_status()
+
+        # linha 2: cliente
+        y += espaco
+        self._texto(
+            _MARGEM_TEXTO_ESQ, y,
+            encaixar_texto(ev.get("cliente", "N/D"), FONTES_PAINEL.cliente,
+                           limite_dir - _MARGEM_TEXTO_ESQ - 58),
+            FONTES_PAINEL.cliente, COR_TEXTO
+        )
+
+        # linha 3: bairro · telefones
+        y += espaco
+        partes = []
+        if ev.get("bairro"):
+            partes.append(str(ev["bairro"]))
+        if ev.get("telefones"):
+            partes.append(str(ev["telefones"]).replace(",", "  ·  "))
+        self._texto(
+            _MARGEM_TEXTO_ESQ, y,
+            encaixar_texto("  ·  ".join(partes), FONTES_PAINEL.meta,
+                           limite_dir - _MARGEM_TEXTO_ESQ),
+            FONTES_PAINEL.meta, COR_TEXTO_MUTED
+        )
+
+        # linha 4 (só garantia): técnico OFS e serviço anterior
+        if self.com_status:
+            y += espaco
+            detalhes = []
+            if ev.get("tecnico_ofs"):
+                detalhes.append(f"Téc. {ev['tecnico_ofs']}")
+            if ev.get("tipo_anterior"):
+                detalhes.append(f"{ev['tipo_anterior']} ({ev.get('dias_aging', '?')}d)")
+            if detalhes:
+                self._texto(
+                    _MARGEM_TEXTO_ESQ, y,
+                    encaixar_texto("  ·  ".join(detalhes), FONTES_PAINEL.rodape_card,
+                                   limite_dir - _MARGEM_TEXTO_ESQ),
+                    FONTES_PAINEL.rodape_card, COR_ROXO_CLARO
+                )
+
+    def _desenhar_status(self):
+        # a bolinha é o glifo ● da própria fonte: sai suavizada pelo
+        # renderizador de texto e entra sozinha no fade, sem virar imagem
+        cor, rotulo = ESTADOS_STATUS.get(self._status, ESTADOS_STATUS["SEM DADOS"])
+        y = self._y_linha1
+        limite_dir = self.largura - _MARGEM_TEXTO_DIR
+
+        self._id_status_texto = self.create_text(
+            limite_dir, y, text=rotulo, font=FONTES_PAINEL.selo, fill=cor, anchor="e"
+        )
+        self._itens_texto.append((self._id_status_texto, cor))
+
+        caixa = self.bbox(self._id_status_texto)
+        self._id_status_ponto = self.create_text(
+            (caixa[0] if caixa else limite_dir) - 8, y,
+            text="●", font=FONTES_PAINEL.selo, fill=cor, anchor="e"
+        )
+        self._itens_texto.append((self._id_status_ponto, cor))
+
+    def definir_status(self, status):
+        """Troca o ONLINE/OFFLINE sem redesenhar o card inteiro."""
+        if not self.com_status:
+            return
+        novo = (status or "SEM DADOS").upper()
+        if novo not in ESTADOS_STATUS:
+            novo = "SEM DADOS"
+        if novo == self._status:
+            return
+        self._status = novo
+        if self.largura < 60:
+            return
+
+        for item in (self._id_status_texto, self._id_status_ponto):
+            if item is not None:
+                self.delete(item)
+        self._itens_texto = [
+            (i, c) for (i, c) in self._itens_texto
+            if i not in (self._id_status_texto, self._id_status_ponto)
+        ]
+        self._desenhar_status()
+        if self._deslocamento:
+            self.move(self._id_status_texto, 0, self._deslocamento)
+            self.move(self._id_status_ponto, 0, self._deslocamento)
+
+        # se o card ainda está no meio do fade, o status novo não pode
+        # aparecer em cor cheia antes do resto
+        if self._passo_atual < QUADROS_ENTRADA - 1:
+            self._aplicar_passo(self._passo_atual)
+
+    # ---------------- selo NOVO ----------------
+    def marcar_como_novo(self, duracao_ms=30000, adiar=False):
+        """adiar=True deixa o selo para o fim da animação: ele aparece no
+        instante em que o card assenta, o que reforça a chegada."""
+        self._pendente_novo = True
+        self._duracao_selo = duracao_ms
+        if not adiar and self.largura >= 60 and self._id_selo_novo is None:
+            self._desenhar_selo_novo()
+
+    def _desenhar_selo_novo(self):
+        self._id_selo_novo = self.create_text(
+            self.largura - _MARGEM_TEXTO_DIR, self._y_linha1 + 24,
+            text="NOVO", font=FONTES_PAINEL.selo, fill=COR_ROXO, anchor="e"
+        )
+        self._itens_texto.append((self._id_selo_novo, COR_ROXO))
+        if self._job_selo:
+            try:
+                self.after_cancel(self._job_selo)
+            except Exception:
+                pass
+        self._job_selo = self.after(self._duracao_selo, self._apagar_selo_novo)
+
+    def _apagar_selo_novo(self, passo=0):
+        """Some devagar: apagado de uma vez, o selo pisca fora da tela e
+        chama atenção justamente quando já não interessa mais."""
+        self._job_selo = None
+        if self._id_selo_novo is None:
+            return
+        total = 12
+        if passo >= total:
+            self.delete(self._id_selo_novo)
+            self._itens_texto = [
+                (i, c) for (i, c) in self._itens_texto if i != self._id_selo_novo
+            ]
+            self._id_selo_novo = None
+            self._pendente_novo = False
+            return
+        try:
+            self.itemconfigure(
+                self._id_selo_novo,
+                fill=misturar_cores(COR_ROXO, COR_CARD, passo / float(total))
+            )
+        except tk.TclError:
+            return
+        self._job_selo = self.after(45, lambda: self._apagar_selo_novo(passo + 1))
+
+    # ---------------- animação ----------------
+    @staticmethod
+    def _suavizar_saida(t):
+        return 1 - (1 - t) ** 3
+
+    @staticmethod
+    def _assentar(t):
+        """ease-out-back: passa ~10% do destino e volta."""
+        c1 = 1.70158
+        c3 = c1 + 1
+        return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+    def _aplicar_passo(self, passo):
+        """Pinta o card no estágio `passo` do fade (0 = invisível)."""
+        self._passo_atual = passo
+        t = passo / float(QUADROS_ENTRADA - 1)
+
+        imagem = fundo_do_cartao(self.largura, self.altura, self.acento, passo)
+        if imagem is not None:
+            self._ref_fundo = imagem
+            try:
+                self.itemconfigure(self._id_fundo, image=imagem)
+            except tk.TclError:
+                return
+
+        for item, cor_final in self._itens_texto:
+            try:
+                self.itemconfigure(item, fill=misturar_cores(COR_FUNDO, cor_final, t))
+            except tk.TclError:
+                pass
+
+    def _aplicar_deslocamento(self, alvo):
+        """Move TUDO que está no canvas para o deslocamento pedido."""
+        delta = alvo - self._deslocamento
+        if abs(delta) < 0.5:
+            return
+        try:
+            self.move("all", 0, delta)
+        except tk.TclError:
+            return
+        self._deslocamento = alvo
+
+    def animar_entrada(self, ao_terminar=None):
+        self._aplicar_passo(0)
+        self._aplicar_deslocamento(-self.altura * self.DESLOCAMENTO_INICIAL)
+        self.configure(height=max(6, int(self.altura * 0.22)))
+        self._animar_quadro(time.monotonic(), ao_terminar)
+
+    def _animar_quadro(self, inicio, ao_terminar):
+        t = min(1.0, (time.monotonic() - inicio) / self.DURACAO_ENTRADA)
+        abertura = self._suavizar_saida(t)
+        pouso = self._assentar(t)
+
+        try:
+            self.configure(height=max(6, int(self.altura * (0.22 + 0.78 * abertura))))
+        except tk.TclError:
+            return
+
+        self._aplicar_deslocamento(
+            -self.altura * self.DESLOCAMENTO_INICIAL * (1 - pouso)
+        )
+
+        passo = int(round(min(1.0, t / 0.75) * (QUADROS_ENTRADA - 1)))
+        if passo != self._passo_atual:
+            self._aplicar_passo(passo)
+
+        if t >= 1.0:
+            self.configure(height=self.altura)
+            self._aplicar_deslocamento(0.0)
+            self._aplicar_passo(QUADROS_ENTRADA - 1)
+            self._job_animacao = None
+            if self._pendente_novo and self._id_selo_novo is None:
+                self._desenhar_selo_novo()   # o selo aparece quando o card pousa
+            if ao_terminar:
+                ao_terminar()
+            return
+
+        self._job_animacao = self.after(
+            16, lambda: self._animar_quadro(inicio, ao_terminar)
+        )
+
+    def redimensionar(self, altura):
+        """Só a altura: a largura chega sozinha pelo <Configure> do grid."""
+        if altura == self.altura:
+            return
+        self.altura = altura
+        self.configure(height=altura)
+        self._desenhar()
+        if self._pendente_novo:
+            self._desenhar_selo_novo()
+
+    def destroy(self):
+        for job in (self._job_animacao, self._job_selo):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        super().destroy()
+
+
+# ------------------------------ coluna -----------------------------------
+class ColunaPainel(tk.Frame):
+    """Cabeçalho de seção + a lista de cards embaixo."""
+
+    def __init__(self, master, titulo, acento, maximo, altura_minima,
+                 altura_maxima, com_status=False):
+        super().__init__(master, bg=COR_FUNDO)
+        self.acento = acento
+        self.maximo = maximo
+        self.altura_minima = altura_minima
+        self.altura_maxima = altura_maxima
+        self.com_status = com_status
+        self.altura_card = altura_minima
+        self.cartoes = []
+
+        cabecalho = tk.Frame(self, bg=COR_FUNDO, height=ALTURA_CABECALHO_SECAO)
+        cabecalho.pack(fill="x", pady=(0, 8))
+        cabecalho.pack_propagate(False)
+
+        self._ref_marca = pilula_marcador(4, 16, acento)
+        marca = tk.Label(cabecalho, bg=COR_FUNDO)
+        if self._ref_marca is not None:
+            marca.configure(image=self._ref_marca)
+        marca.pack(side="left", pady=(2, 0))
+
+        tk.Label(
+            cabecalho, text=espacar_titulo(titulo), bg=COR_FUNDO, fg=COR_TEXTO,
+            font=FONTES_PAINEL.secao, anchor="w"
+        ).pack(side="left", padx=(11, 0))
+
+        self.rotulo_contagem = tk.Label(
+            cabecalho, text="0", bg=COR_FUNDO, fg=COR_TEXTO_MUTED,
+            font=FONTES_PAINEL.secao_contagem, anchor="w"
+        )
+        self.rotulo_contagem.pack(side="left", padx=(12, 0))
+
+        self.rotulo_extra = tk.Label(
+            cabecalho, text="", bg=COR_FUNDO, fg=COR_TEXTO_MUTED,
+            font=FONTES_PAINEL.secao_contagem, anchor="e"
+        )
+        self.rotulo_extra.pack(side="right")
+
+        self.lista = tk.Frame(self, bg=COR_FUNDO)
+        self.lista.pack(fill="both", expand=True)
+        self.lista.grid_columnconfigure(0, weight=1)
+
+        self.vazio = tk.Label(
+            self.lista, text="Sem registros por enquanto",
+            bg=COR_FUNDO, fg=COR_TEXTO_MUTED, font=FONTES_PAINEL.vazio
+        )
+        self.vazio.grid(row=0, column=0, pady=34, sticky="ew")
+
+    def altura_util(self):
+        altura = self.lista.winfo_height()
+        if altura <= 20:
+            altura = self.winfo_toplevel().winfo_screenheight() - 150
+        return max(200, altura)
+
+    def calcular_altura_card(self):
+        """Divide a altura da coluna pelo NÚMERO MÁXIMO de itens, e não pelos
+        que estão em tela: assim o card não muda de tamanho a cada evento que
+        chega — a lista cresce sempre com a mesma medida e, cheia, ocupa a
+        tela inteira sem sobrar faixa vazia."""
+        disponivel = self.altura_util() - (self.maximo - 1) * ESPACO_ENTRE_CARDS
+        altura = disponivel // self.maximo
+        return max(self.altura_minima, min(self.altura_maxima, altura))
+
+    def adicionar(self, evento, animar=True):
+        if self.vazio.winfo_ismapped():
+            self.vazio.grid_forget()
+
+        self.altura_card = self.calcular_altura_card()
+        cartao = Cartao(self.lista, self.altura_card, self.acento, evento,
+                        com_status=self.com_status)
+        self.cartoes.insert(0, cartao)
+        self._reposicionar()
+
+        while len(self.cartoes) > self.maximo:
+            self.cartoes.pop().destroy()
+
+        # deixa o grid dar a largura ao card ANTES de qualquer coisa: senão o
+        # primeiro quadro da animação sai vazio e o conteúdo "pipoca" no fim
+        self.lista.update_idletasks()
+        cartao.garantir_desenho()
+
+        if animar:
+            cartao.marcar_como_novo(adiar=True)
+            cartao.animar_entrada()
+
+        self.rotulo_contagem.configure(text=str(len(self.cartoes)))
+        return cartao
+
+    def _reposicionar(self):
+        for indice, cartao in enumerate(self.cartoes):
+            cartao.grid(row=indice, column=0, sticky="ew",
+                        pady=(0, ESPACO_ENTRE_CARDS))
+
+    def definir_extra(self, texto):
+        self.rotulo_extra.configure(text=texto)
+
+    def redimensionar(self):
+        self.altura_card = self.calcular_altura_card()
+        for cartao in self.cartoes:
+            cartao.redimensionar(self.altura_card)
+
+    def cartao_por_contrato(self):
+        mapa = {}
+        for cartao in self.cartoes:
+            contrato = str(cartao.evento.get("contrato", "")).strip()
+            if contrato:
+                mapa.setdefault(contrato, []).append(cartao)
+        return mapa
+
+    def contratos(self):
+        return [
+            str(c.evento.get("contrato", "")).strip()
+            for c in self.cartoes
+            if str(c.evento.get("contrato", "")).strip()
+        ]
+
+
+# ------------------------------ painel -----------------------------------
 class PainelTV(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Central de Monitoramento - CAMPO Logística")
         self.configure(bg=COR_FUNDO)
 
+        global FONTES_PAINEL
+        FONTES_PAINEL = FontesPainel()
+
         self._em_tela_cheia = False
+        self._logo_ref = None
+        self._job_ajuste = None
+        self._job_preaquecer = None
+        self._alerta_ativo = False
+        self._job_alerta = None
+        self._job_respiracao = None
+        self._job_barra = None
+        self._fase_respiracao = 0.0
+        self._contrato_em_alerta = ""
+        self._etiqueta_status_alerta = None
+        self._itens_overlay = []
+
+        self.dados_capex_salvos = []
+        self.dados_garantias_salvos = []
+
         self.update_idletasks()
         self.after(150, self._aplicar_tela_cheia)
 
-        self.bind('<Escape>', lambda e: self._alternar_tela_cheia(False))
-        self.bind('<F11>', lambda e: self._alternar_tela_cheia(not self._em_tela_cheia))
+        self.bind("<Escape>", lambda e: self._alternar_tela_cheia(False))
+        self.bind("<F11>", lambda e: self._alternar_tela_cheia(not self._em_tela_cheia))
+        self.bind("<Configure>", self._agendar_ajuste)
 
-        self.itens_capex = []
-        self.itens_garantia = []
-        self.dados_capex_salvos = []
-        self.dados_garantias_salvos = []
-        self._alerta_ativo = False
-        self._piscar_estado = False
-        self._job_alerta = None
-        self._logo_imagem_ref = None
-
-        self._montar_layout_base()
-        self._carregar_historico_painel()
+        self._montar_layout()
         self._montar_overlay_alerta()
+        self._carregar_historico_painel()
         self._atualizar_relogio()
         self._processar_fila()
         self._processar_fila_clima()
+        self._processar_fila_status()
 
-        threading.Thread(target=thread_atualizacao_clima, daemon=True).start()
+        iniciar_threads_do_painel()
+
+    # ---------------- layout ----------------
+    def _montar_layout(self):
+        # O topo se separa do corpo só pela cor da superfície. Não há régua de
+        # 1px: no Tk ela sairia dura e desalinhada, e o site também não usa
+        # borda aqui — usa contraste de superfície.
+        topo = tk.Frame(self, bg=COR_SUPERFICIE, height=ALTURA_TOPO)
+        topo.pack(fill="x", side="top")
+        topo.pack_propagate(False)
+
+        esquerda = tk.Frame(topo, bg=COR_SUPERFICIE)
+        esquerda.pack(side="left", padx=(26, 0))
+
+        self.logo_label = tk.Label(esquerda, bg=COR_SUPERFICIE)
+        logo = self._carregar_imagem_logo(altura_desejada=34)
+        if logo is not None:
+            self._logo_ref = logo
+            self.logo_label.configure(image=logo)
+        self.logo_label.pack(side="left", pady=(2, 0))
+
+        tk.Label(
+            esquerda, text=espacar_titulo("CENTRAL DE ALERTA"),
+            bg=COR_SUPERFICIE, fg=COR_TEXTO_MUTED, font=FONTES_PAINEL.titulo_topo
+        ).pack(side="left", padx=(26, 0))
+
+        direita = tk.Frame(topo, bg=COR_SUPERFICIE)
+        direita.pack(side="right", padx=(0, 28))
+
+        bloco_relogio = tk.Frame(direita, bg=COR_SUPERFICIE)
+        bloco_relogio.pack(side="right", pady=(6, 6))
+
+        self.relogio_label = tk.Label(
+            bloco_relogio, text="", bg=COR_SUPERFICIE, fg=COR_TEXTO,
+            font=FONTES_PAINEL.relogio, anchor="e"
+        )
+        self.relogio_label.pack(side="bottom", anchor="e")
+
+        self.data_label = tk.Label(
+            bloco_relogio, text="", bg=COR_SUPERFICIE, fg=COR_TEXTO_MUTED,
+            font=FONTES_PAINEL.data, anchor="e"
+        )
+        self.data_label.pack(side="bottom", anchor="e")
+
+        self.clima_label = tk.Label(
+            direita, text=f"{CIDADE_CLIMA} · carregando…",
+            bg=COR_SUPERFICIE, fg=COR_TEXTO_MUTED, font=FONTES_PAINEL.clima, anchor="e"
+        )
+        self.clima_label.pack(side="right", padx=(0, 30))
+
+        corpo = tk.Frame(self, bg=COR_FUNDO)
+        corpo.pack(fill="both", expand=True, padx=26, pady=(18, 20))
+        corpo.grid_columnconfigure(0, weight=1, uniform="col")
+        corpo.grid_columnconfigure(1, weight=1, uniform="col")
+        corpo.grid_rowconfigure(0, weight=1)
+
+        self.coluna_capex = ColunaPainel(
+            corpo, "ENTRANTES DE CAPEX", COR_DESTAQUE, MAX_ITENS_CAPEX,
+            altura_minima=74, altura_maxima=104
+        )
+        self.coluna_capex.grid(row=0, column=0, sticky="nsew", padx=(0, 13))
+
+        self.coluna_garantia = ColunaPainel(
+            corpo, "GARANTIAS", COR_VERMELHO, MAX_ITENS_GARANTIA,
+            altura_minima=96, altura_maxima=136, com_status=True
+        )
+        self.coluna_garantia.grid(row=0, column=1, sticky="nsew", padx=(13, 0))
+        self.coluna_garantia.definir_extra("Autenticador · aguardando")
+
+    def _carregar_imagem_logo(self, altura_desejada=34):
+        for caminho in CAMINHOS_LOGO_PAINEL:
+            if not os.path.exists(caminho):
+                continue
+            try:
+                if _PIL_DISPONIVEL:
+                    imagem = Image.open(caminho).convert("RGBA")
+                    proporcao = altura_desejada / float(imagem.height)
+                    imagem = imagem.resize(
+                        (max(1, int(imagem.width * proporcao)), altura_desejada),
+                        Image.LANCZOS
+                    )
+                    # o PNG é transparente: achatar sobre a cor do topo, senão
+                    # o Tk compõe sobre preto e deixa uma auréola em volta
+                    fundo = Image.new("RGBA", imagem.size, COR_SUPERFICIE)
+                    return ImageTk.PhotoImage(
+                        Image.alpha_composite(fundo, imagem).convert("RGB")
+                    )
+                imagem = tk.PhotoImage(file=caminho)
+                fator = max(1, round(imagem.height() / altura_desejada))
+                return imagem.subsample(fator, fator)
+            except Exception as e:
+                logger.warning(f"Falha ao carregar o logo '{os.path.basename(caminho)}': {e}")
+                continue
+        logger.warning("Nenhum logo encontrado para o Painel de TV.")
+        return None
 
     def _aplicar_tela_cheia(self):
         self.update_idletasks()
-        largura = self.winfo_screenwidth()
-        altura = self.winfo_screenheight()
-        self.geometry(f"{largura}x{altura}+0+0")
-
+        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
         try:
-            self.attributes('-fullscreen', True)
+            self.attributes("-fullscreen", True)
         except Exception:
             pass
-
         try:
-            self.state('zoomed')
+            self.state("zoomed")
         except Exception:
             pass
-
         self._em_tela_cheia = True
 
     def _alternar_tela_cheia(self, ligar):
         if ligar:
             self._aplicar_tela_cheia()
-        else:
-            try:
-                self.attributes('-fullscreen', False)
-            except Exception:
-                pass
-            self._em_tela_cheia = False
-            self.geometry("1600x900")
+            return
+        try:
+            self.attributes("-fullscreen", False)
+        except Exception:
+            pass
+        self._em_tela_cheia = False
+        self.geometry("1600x900")
 
+    def _agendar_ajuste(self, evento=None):
+        # binding de <Configure> na janela também recebe o Configure de TODO
+        # widget filho (a bindtag do toplevel está na cadeia de cada um). Sem
+        # este filtro, cada quadro da animação de um card reagendaria um
+        # recálculo geral do painel.
+        if evento is not None and evento.widget is not self:
+            return
+        if self._job_ajuste:
+            self.after_cancel(self._job_ajuste)
+        self._job_ajuste = self.after(180, self._reajustar_cartoes)
+
+    def _reajustar_cartoes(self):
+        self._job_ajuste = None
+        limpar_cache_formas()
+        self.coluna_capex.redimensionar()
+        self.coluna_garantia.redimensionar()
+        self._agendar_preaquecimento()
+
+    def _agendar_preaquecimento(self):
+        if self._job_preaquecer:
+            self.after_cancel(self._job_preaquecer)
+        self._job_preaquecer = self.after(1500, self._preaquecer_fundos)
+
+    def _preaquecer_fundos(self, pendentes=None):
+        """Gera antes da hora as imagens dos passos do fade.
+
+        Sem isto, o primeiro entrante do dia paga a conta: são 9 imagens por
+        tamanho/cor desenhadas em 3x e reduzidas, e nesta máquina isso trava
+        a tela bem no meio da animação. Uma imagem por tique mantém o painel
+        respondendo enquanto o cache enche.
+        """
+        self._job_preaquecer = None
+        if not _PIL_DISPONIVEL:
+            return
+
+        if pendentes is None:
+            pendentes = []
+            for coluna in (self.coluna_capex, self.coluna_garantia):
+                largura = coluna.lista.winfo_width()
+                if largura <= 100:
+                    return
+                for passo in range(QUADROS_ENTRADA):
+                    pendentes.append((largura, coluna.altura_card,
+                                      coluna.acento, passo))
+
+        if not pendentes:
+            return
+        largura, altura, acento, passo = pendentes[0]
+        fundo_do_cartao(largura, altura, acento, passo)
+        self._job_preaquecer = self.after(
+            30, lambda: self._preaquecer_fundos(pendentes[1:])
+        )
+
+    # ---------------- histórico em disco ----------------
     def _salvar_historico_painel(self):
         try:
             dados = {
                 "capex": self.dados_capex_salvos,
                 "garantia": self.dados_garantias_salvos
             }
-            salvar_json_atomico(ARQUIVO_HISTORICO_PAINEL, dados, ensure_ascii=False, indent=2)
+            salvar_json_atomico(ARQUIVO_HISTORICO_PAINEL, dados,
+                                ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"Falha ao salvar histórico do painel de TV: {e}")
 
@@ -4178,198 +5137,25 @@ class PainelTV(tk.Tk):
             self.dados_capex_salvos = dados.get("capex", [])[:MAX_ITENS_CAPEX]
             self.dados_garantias_salvos = dados.get("garantia", [])[:MAX_ITENS_GARANTIA]
 
-            if self.dados_capex_salvos:
-                if self.placeholder_capex.winfo_ismapped():
-                    self.placeholder_capex.grid_forget()
-                for ev in reversed(self.dados_capex_salvos):
-                    novo_item = self._criar_item_capex(ev)
-                    self.itens_capex.insert(0, novo_item)
-                for index, it in enumerate(self.itens_capex):
-                    it.grid(row=index, column=0, sticky="ew", pady=3)
+            # do mais antigo para o mais novo: cada adicionar() insere no topo
+            for evento in reversed(self.dados_capex_salvos):
+                self.coluna_capex.adicionar(evento, animar=False)
+            for evento in reversed(self.dados_garantias_salvos):
+                self.coluna_garantia.adicionar(evento, animar=False)
 
-            if self.dados_garantias_salvos:
-                if self.placeholder_garantia.winfo_ismapped():
-                    self.placeholder_garantia.grid_forget()
-                for ev in reversed(self.dados_garantias_salvos):
-                    novo_item = self._criar_item_garantia(ev)
-                    self.itens_garantia.insert(0, novo_item)
-                for index, it in enumerate(self.itens_garantia):
-                    it.grid(row=index, column=0, sticky="ew", pady=3)
+            self._publicar_contratos_garantia()
         except Exception as e:
             logger.warning(f"Falha ao carregar histórico do painel de TV: {e}")
 
-    def _montar_layout_base(self):
-        header = tk.Frame(self, bg=COR_SIDEBAR, height=110)
-        header.pack(fill="x", side="top")
-        header.pack_propagate(False)
+    def _publicar_contratos_garantia(self):
+        registrar_contratos_painel(self.coluna_garantia.contratos())
 
-        header.grid_columnconfigure(0, weight=0)
-        header.grid_columnconfigure(1, weight=1)
-        header.grid_columnconfigure(2, weight=0)
-        header.grid_columnconfigure(3, weight=0)
-        header.grid_rowconfigure(0, weight=1)
-
-        self.logo_label = tk.Label(header, bg=COR_SIDEBAR)
-        imagem_logo = self._carregar_imagem_logo(altura_desejada=60)
-        if imagem_logo is not None:
-            self._logo_imagem_ref = imagem_logo
-            self.logo_label.configure(image=imagem_logo)
-        self.logo_label.grid(row=0, column=0, sticky="w", padx=(35, 10), pady=8)
-
-        self.clima_label = tk.Label(
-            header, text=f"🌡️ {CIDADE_CLIMA}: carregando...",
-            bg=COR_SIDEBAR, fg=COR_TEXTO_MUTED, font=("Segoe UI", 16, "bold"),
-            anchor="e", justify="right"
-        )
-        self.clima_label.grid(row=0, column=2, sticky="e", padx=25, pady=12)
-
-        self.relogio_label = tk.Label(
-            header, text="", bg=COR_SIDEBAR, fg=COR_TEXTO,
-            font=("Consolas", 26, "bold"), anchor="e"
-        )
-        self.relogio_label.grid(row=0, column=3, sticky="e", padx=45, pady=12)
-
-        self._job_ajuste_titulo = None
-        self.bind('<Configure>', self._agendar_ajuste_titulo)
-
-        self._configurar_estilo_abas()
-
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=0, pady=(6, 0))
-
-        self.aba_alerta = tk.Frame(self.notebook, bg=COR_FUNDO)
-        self.notebook.add(self.aba_alerta, text="  Central de Alerta  ")
-
-        tk.Label(
-            self.aba_alerta, text="CENTRAL DE ALERTA",
-            bg=COR_FUNDO, fg=COR_TEXTO_MUTED, font=("Segoe UI", 16, "bold")
-        ).pack(fill="x", pady=(10, 6))
-
-        self.corpo = tk.Frame(self.aba_alerta, bg=COR_FUNDO)
-        self.corpo.pack(fill="both", expand=True, padx=35, pady=(0, 12))
-        self.corpo.grid_columnconfigure(0, weight=1, uniform="colunas")
-        self.corpo.grid_columnconfigure(1, weight=1, uniform="colunas")
-        self.corpo.grid_rowconfigure(1, weight=1)
-
-        frame_capex = tk.Frame(self.corpo, bg=COR_FUNDO)
-        frame_capex.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 15))
-
-        tk.Label(
-            frame_capex, text="🟦 ENTRANTES DE CAPEX", bg=COR_FUNDO, fg=COR_DESTAQUE,
-            font=("Segoe UI", 17, "bold"), anchor="w"
-        ).pack(fill="x", pady=(0, 6))
-
-        self.lista_capex_container = tk.Frame(frame_capex, bg=COR_FUNDO)
-        self.lista_capex_container.pack(fill="both", expand=True)
-        self.lista_capex_container.grid_columnconfigure(0, weight=1)
-
-        self.placeholder_capex = tk.Label(
-            self.lista_capex_container, text="Aguardando entrantes...",
-            bg=COR_FUNDO, fg=COR_TEXTO_MUTED, font=("Segoe UI", 15, "italic")
-        )
-        self.placeholder_capex.grid(row=0, column=0, pady=30, sticky="ew")
-
-        frame_garantia = tk.Frame(self.corpo, bg=COR_FUNDO)
-        frame_garantia.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(15, 0))
-
-        tk.Label(
-            frame_garantia, text="🟥 GARANTIAS", bg=COR_FUNDO, fg=COR_ALERTA,
-            font=("Segoe UI", 17, "bold"), anchor="w"
-        ).pack(fill="x", pady=(0, 6))
-
-        self.lista_garantia_container = tk.Frame(frame_garantia, bg=COR_FUNDO)
-        self.lista_garantia_container.pack(fill="both", expand=True)
-        self.lista_garantia_container.grid_columnconfigure(0, weight=1)
-
-        self.placeholder_garantia = tk.Label(
-            self.lista_garantia_container, text="Aguardando garantias...",
-            bg=COR_FUNDO, fg=COR_TEXTO_MUTED, font=("Segoe UI", 15, "italic")
-        )
-        self.placeholder_garantia.grid(row=0, column=0, pady=30, sticky="ew")
-
-    def _configurar_estilo_abas(self):
-        estilo = ttk.Style(self)
-        try:
-            estilo.theme_use("clam")
-        except Exception:
-            pass
-        estilo.configure("TNotebook", background=COR_FUNDO, borderwidth=0)
-        estilo.configure(
-            "TNotebook.Tab",
-            background=COR_SIDEBAR, foreground=COR_TEXTO_MUTED,
-            padding=(18, 10), font=("Segoe UI", 11, "bold"), borderwidth=0
-        )
-        estilo.map(
-            "TNotebook.Tab",
-            background=[("selected", COR_CARD)],
-            foreground=[("selected", COR_TEXTO)]
-        )
-
-    def _carregar_imagem_logo(self, altura_desejada=70):
-        if not os.path.exists(CAMINHO_LOGO_OPERACIONAL):
-            logger.warning(f"Logo '{os.path.basename(CAMINHO_LOGO_OPERACIONAL)}' não encontrada.")
-            return None
-        try:
-            if _PIL_DISPONIVEL:
-                imagem = Image.open(CAMINHO_LOGO_OPERACIONAL)
-                proporcao = altura_desejada / float(imagem.height)
-                largura_nova = max(1, int(imagem.width * proporcao))
-                imagem = imagem.resize((largura_nova, altura_desejada), Image.LANCZOS)
-                return ImageTk.PhotoImage(imagem)
-            else:
-                logger.warning("Pillow não instalado: redimensionando logo com subsample.")
-                imagem = tk.PhotoImage(file=CAMINHO_LOGO_OPERACIONAL)
-                altura_original = imagem.height()
-                if altura_original > altura_desejada:
-                    fator = max(1, round(altura_original / altura_desejada))
-                    imagem = imagem.subsample(fator, fator)
-                return imagem
-        except Exception as e:
-            logger.warning(f"Falha ao carregar a logo: {e}")
-            return None
-
-    def _montar_overlay_alerta(self):
-        self.overlay = tk.Frame(self, bg=COR_ALERTA)
-
-        self.overlay_titulo = tk.Label(
-            self.overlay, text="⚠  ALERTA DE GARANTIA  ⚠",
-            bg=COR_ALERTA, fg="#FFFFFF", font=("Segoe UI", 64, "bold")
-        )
-        self.overlay_titulo.pack(pady=(70, 40))
-
-        self.overlay_corpo = tk.Frame(self.overlay, bg=COR_ALERTA)
-        self.overlay_corpo.pack(expand=True, fill="both", padx=120)
-
-    def _agendar_ajuste_titulo(self, event=None):
-        if self._job_ajuste_titulo:
-            self.after_cancel(self._job_ajuste_titulo)
-        self._job_ajuste_titulo = self.after(150, self._reajustar_wraplength_itens)
-
+    # ---------------- relógio / clima ----------------
     def _atualizar_relogio(self):
-        agora = datetime.now().strftime("%d/%m/%Y   %H:%M:%S")
-        self.relogio_label.configure(text=agora)
+        agora = datetime.now()
+        self.relogio_label.configure(text=agora.strftime("%H:%M:%S"))
+        self.data_label.configure(text=agora.strftime("%d/%m/%Y"))
         self.after(1000, self._atualizar_relogio)
-
-    def _processar_fila(self):
-        # /ocultarpaineltv chega por outra thread, e Tk não aceita ser destruído
-        # de fora da principal. Então o comando só limpa o Event e o fechamento
-        # acontece aqui, dentro do próprio laço do Tk, que é onde é seguro.
-        if not painel_tv_pedido():
-            logger.info("Painel de TV fechado a pedido do grupo (/ocultarpaineltv).")
-            self.destroy()
-            return
-
-        try:
-            while True:
-                evento = FILA_EVENTOS_TV.get_nowait()
-                if evento.get('tipo') == 'garantia':
-                    self._exibir_alerta_garantia(evento)
-                    self._adicionar_item_garantia(evento)
-                else:
-                    self._adicionar_item_capex(evento)
-        except queue.Empty:
-            pass
-        self.after(300, self._processar_fila)
 
     def _processar_fila_clima(self):
         previsao_mais_recente = None
@@ -4387,199 +5173,298 @@ class PainelTV(tk.Tk):
     def _atualizar_label_clima(self, previsao):
         temperatura = previsao.get('temperatura')
         descricao = previsao.get('descricao', 'N/D')
-        emoji = previsao.get('emoji', '🌡️')
+        emoji = previsao.get('emoji', '')
 
         if temperatura is not None:
-            texto = f"{emoji} {CIDADE_CLIMA}: {temperatura:.0f}°C — {descricao}"
+            texto = f"{emoji} {CIDADE_CLIMA}  ·  {temperatura:.0f}°C  ·  {descricao}"
         else:
-            texto = f"{emoji} {CIDADE_CLIMA}: {descricao}"
+            texto = f"{emoji} {CIDADE_CLIMA}  ·  {descricao}"
 
-        self.clima_label.configure(text=texto)
+        self.clima_label.configure(text=texto.strip())
 
-    def _obter_wraplength_lista(self, container, margem=50):
-        self.update_idletasks()
-        largura = container.winfo_width()
-        if largura <= 10:
-            largura = self.winfo_screenwidth() // 2
-        return max(280, largura - margem)
+    # ---------------- eventos ----------------
+    def _processar_fila(self):
+        # /ocultarpaineltv chega por outra thread, e Tk não aceita ser destruído
+        # de fora da principal. Então o comando só limpa o Event e o fechamento
+        # acontece aqui, dentro do próprio laço do Tk, que é onde é seguro.
+        if not painel_tv_pedido():
+            logger.info("Painel de TV fechado a pedido do grupo (/ocultarpaineltv).")
+            self.destroy()
+            return
 
-    def _criar_item_compacto(self, container, cor_borda, linha1, linha2, linha3=None):
-        item = tk.Frame(container, bg=COR_CARD, highlightbackground=cor_borda, highlightthickness=1)
+        try:
+            while True:
+                evento = FILA_EVENTOS_TV.get_nowait()
+                if evento.get('tipo') == 'garantia':
+                    self.coluna_garantia.adicionar(evento)
+                    self.dados_garantias_salvos.insert(0, evento)
+                    del self.dados_garantias_salvos[MAX_ITENS_GARANTIA:]
+                    self._publicar_contratos_garantia()
+                    _PEDIDO_STATUS_AUTENTICADOR.set()   # consulta o Autenticador já
+                    self._exibir_alerta_garantia(evento)
+                else:
+                    self.coluna_capex.adicionar(evento)
+                    self.dados_capex_salvos.insert(0, evento)
+                    del self.dados_capex_salvos[MAX_ITENS_CAPEX:]
+                self._salvar_historico_painel()
+        except queue.Empty:
+            pass
+        self.after(300, self._processar_fila)
 
-        label1 = tk.Label(
-            item, text=linha1, bg=COR_CARD, fg=COR_TEXTO,
-            font=("Segoe UI", 13, "bold"), anchor="w", justify="left"
+    def _processar_fila_status(self):
+        ultimo = None
+        try:
+            while True:
+                ultimo = FILA_STATUS_AUTENTICADOR.get_nowait()
+        except queue.Empty:
+            pass
+
+        if ultimo is not None:
+            mapa = self.coluna_garantia.cartao_por_contrato()
+            for contrato, status in ultimo.get("status", {}).items():
+                for cartao in mapa.get(str(contrato), []):
+                    cartao.definir_status(status)
+            self.coluna_garantia.definir_extra(ultimo.get("rodape", ""))
+
+            # o alerta pode estar na tela antes de o Autenticador responder
+            if self._alerta_ativo and self._contrato_em_alerta:
+                novo = ultimo.get("status", {}).get(self._contrato_em_alerta)
+                if novo and self._etiqueta_status_alerta is not None:
+                    cor, rotulo = ESTADOS_STATUS.get(
+                        str(novo).upper(), ESTADOS_STATUS["SEM DADOS"]
+                    )
+                    try:
+                        self._etiqueta_status_alerta.configure(text=f"● {rotulo}", fg=cor)
+                    except tk.TclError:
+                        pass
+
+        self.after(1000, self._processar_fila_status)
+
+    # ---------------- alerta de garantia ----------------
+    #
+    # Alarme de sala: tem que ser visto do outro lado do ambiente e, ao mesmo
+    # tempo, ser lido por quem chega perto. Quem pulsa é só a MOLDURA, e por
+    # interpolação — respirar chama a atenção igual a piscar, sem castigar
+    # quem trabalha na sala nem apagar o texto meio segundo a cada ciclo. O
+    # miolo fica escuro, com os dados em blocos grandes e uma barra mostrando
+    # quanto falta para o alerta sair sozinho.
+    def _montar_overlay_alerta(self):
+        self.overlay = tk.Frame(self, bg=COR_ALERTA)
+        self.overlay_miolo = tk.Frame(self.overlay, bg=COR_FUNDO)
+        self.overlay_miolo.pack(fill="both", expand=True, padx=18, pady=18)
+
+        # a barra de tempo é empacotada ANTES do conteúdo: o conteúdo usa
+        # expand=True e, se viesse primeiro, engoliria a faixa inteira
+        self.overlay_trilho = tk.Frame(self.overlay_miolo, bg=COR_CARD, height=7)
+        self.overlay_trilho.pack(fill="x", side="bottom")
+        self.overlay_trilho.pack_propagate(False)
+        self.overlay_barra = tk.Frame(self.overlay_trilho, bg=COR_ALERTA)
+        self.overlay_barra.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+
+        self.overlay_conteudo = tk.Frame(self.overlay_miolo, bg=COR_FUNDO)
+        self.overlay_conteudo.pack(fill="both", expand=True, padx=64)
+
+    def _rotulo_overlay(self, master, texto, fonte, cor, **kwargs):
+        etiqueta = tk.Label(master, text=texto, bg=COR_FUNDO, fg=cor, font=fonte,
+                            anchor="w", justify="left", **kwargs)
+        self._itens_overlay.append((etiqueta, cor))
+        return etiqueta
+
+    def _largura_conteudo_alerta(self):
+        """Largura real de onde o texto do alerta cabe.
+
+        Medida do próprio overlay, e não da janela: no momento em que o alerta
+        é montado a janela pode ainda não ter chegado ao tamanho final, e uma
+        medida pequena demais faz o nome do cliente sair truncado. Por isso o
+        overlay é posicionado antes de o conteúdo ser montado.
+        """
+        largura = self.overlay_conteudo.winfo_width()
+        if largura <= 200:   # ainda não dimensionado: cai na tela toda
+            largura = self.winfo_screenwidth() - 2 * 18 - 2 * 64
+        return max(400, largura)
+
+    def _largura_coluna_alerta(self):
+        return max(200, self._largura_conteudo_alerta() // 4)
+
+    def _bloco_overlay(self, master, rotulo, valor, cor_valor=COR_TEXTO,
+                       linha=0, coluna=0, colunas=1, espaco_acima=0):
+        """Devolve a etiqueta do VALOR — é ela que pode mudar depois (o
+        status de conexão chega do Autenticador com o alerta já na tela)."""
+        caixa = tk.Frame(master, bg=COR_FUNDO)
+        caixa.grid(row=linha, column=coluna, columnspan=colunas, sticky="w",
+                   pady=(espaco_acima, 0))
+        self._rotulo_overlay(caixa, espacar_titulo(rotulo),
+                             FONTES_PAINEL.alerta_rotulo, COR_TEXTO_MUTED).pack(anchor="w")
+        etiqueta_valor = self._rotulo_overlay(
+            caixa,
+            encaixar_texto(valor, FONTES_PAINEL.alerta_valor,
+                           self._largura_coluna_alerta() * colunas - 26),
+            FONTES_PAINEL.alerta_valor, cor_valor
         )
-        label1.pack(fill="x", padx=10, pady=(4, 0))
+        etiqueta_valor.pack(anchor="w", pady=(5, 0))
+        return etiqueta_valor
 
-        label2 = tk.Label(
-            item, text=linha2, bg=COR_CARD, fg=COR_TEXTO_MUTED,
-            font=("Segoe UI", 11), anchor="w", justify="left",
-            wraplength=self._obter_wraplength_lista(container)
-        )
-        label2.pack(fill="x", padx=10, pady=(1, 0 if linha3 else 4))
-
-        labels_wrap = [label2]
-        if linha3:
-            label3 = tk.Label(
-                item, text=linha3, bg=COR_CARD, fg=COR_VERDE,
-                font=("Segoe UI", 11, "bold"), anchor="w", justify="left",
-                wraplength=self._obter_wraplength_lista(container)
-            )
-            label3.pack(fill="x", padx=10, pady=(0, 4))
-            labels_wrap.append(label3)
-
-        item._labels_wrap = labels_wrap
-        return item
-
-    def _criar_item_capex(self, evento):
-        linha1 = (
-            f"{evento.get('timestamp', '')}   📍 {evento.get('unidade', 'N/D')}   "
-            f"Contrato: {evento.get('contrato', 'N/D')}"
-        )
-        linha2 = (
-            f"Cliente: {evento.get('cliente', 'N/D')}  |  "
-            f"Bairro: {evento.get('bairro', 'N/D')}  |  "
-            f"📞 {evento.get('telefones', 'N/D')}"
-        )
-        return self._criar_item_compacto(self.lista_capex_container, COR_DESTAQUE, linha1=linha1, linha2=linha2)
-
-    def _adicionar_item_capex(self, evento):
-        if self.placeholder_capex.winfo_ismapped():
-            self.placeholder_capex.grid_forget()
-
-        novo_item = self._criar_item_capex(evento)
-        self.itens_capex.insert(0, novo_item)
-        self.dados_capex_salvos.insert(0, evento)
-
-        for index, it in enumerate(self.itens_capex):
-            it.grid(row=index, column=0, sticky="ew", pady=3)
-
-        while len(self.itens_capex) > MAX_ITENS_CAPEX:
-            antigo = self.itens_capex.pop()
-            antigo.destroy()
-
-        while len(self.dados_capex_salvos) > MAX_ITENS_CAPEX:
-            self.dados_capex_salvos.pop()
-
-        self._salvar_historico_painel()
-
-    def _criar_item_garantia(self, evento):
-        linha1 = (
-            f"{evento.get('timestamp', '')}   📍 {evento.get('unidade', 'N/D')}   "
-            f"Contrato: {evento.get('contrato', 'N/D')}"
-        )
-
-        detalhe_extra = ""
-        if evento.get('tipo_anterior'):
-            detalhe_extra = f"  |  Serv. anterior: {evento['tipo_anterior']} ({evento.get('dias_aging', '?')}d)"
-
-        linha2 = (
-            f"Cliente: {evento.get('cliente', 'N/D')}  |  "
-            f"Bairro: {evento.get('bairro', 'N/D')}  |  "
-            f"📞 {evento.get('telefones', 'N/D')}{detalhe_extra}"
-        )
-
-        linha3 = None
-        if evento.get('tecnico_ofs'):
-            linha3 = f"Técnico OFS: {evento['tecnico_ofs']}"
-
-        return self._criar_item_compacto(self.lista_garantia_container, COR_ALERTA, linha1, linha2, linha3)
-
-    def _adicionar_item_garantia(self, evento):
-        if self.placeholder_garantia.winfo_ismapped():
-            self.placeholder_garantia.grid_forget()
-
-        novo_item = self._criar_item_garantia(evento)
-        self.itens_garantia.insert(0, novo_item)
-        self.dados_garantias_salvos.insert(0, evento)
-
-        for index, it in enumerate(self.itens_garantia):
-            it.grid(row=index, column=0, sticky="ew", pady=3)
-
-        while len(self.itens_garantia) > MAX_ITENS_GARANTIA:
-            antigo = self.itens_garantia.pop()
-            antigo.destroy()
-
-        while len(self.dados_garantias_salvos) > MAX_ITENS_GARANTIA:
-            self.dados_garantias_salvos.pop()
-
-        self._salvar_historico_painel()
-
-    def _reajustar_wraplength_itens(self):
-        novo_wrap_capex = self._obter_wraplength_lista(self.lista_capex_container)
-        novo_wrap_garantia = self._obter_wraplength_lista(self.lista_garantia_container)
-
-        for it in self.itens_capex:
-            for label in getattr(it, '_labels_wrap', []):
-                try:
-                    label.configure(wraplength=novo_wrap_capex)
-                except Exception:
-                    pass
-
-        for it in self.itens_garantia:
-            for label in getattr(it, '_labels_wrap', []):
-                try:
-                    label.configure(wraplength=novo_wrap_garantia)
-                except Exception:
-                    pass
+    def _status_do_contrato(self, contrato):
+        for cartao in self.coluna_garantia.cartoes:
+            if str(cartao.evento.get("contrato", "")).strip() == contrato:
+                return cartao._status
+        return "VERIFICANDO"
 
     def _exibir_alerta_garantia(self, evento):
-        for widget in self.overlay_corpo.winfo_children():
-            widget.destroy()
-
-        linhas = [
-            f"Unidade: {evento.get('unidade', 'N/D')}",
-            f"Contrato: {evento.get('contrato', 'N/D')}",
-            f"Cliente: {evento.get('cliente', 'N/D')}",
-            f"Bairro: {evento.get('bairro', 'N/D')}",
-            f"Telefone(s): {evento.get('telefones', 'N/D')}",
-        ]
-        if evento.get('tecnico_ofs'):
-            linhas.append(f"Técnico OFS: {evento['tecnico_ofs']}")
-        if evento.get('tipo_anterior'):
-            linhas.append(
-                f"Serviço anterior: {evento['tipo_anterior']}  (concluído há {evento.get('dias_aging', '?')} dias)"
-            )
-
-        for txt in linhas:
-            tk.Label(
-                self.overlay_corpo, text=txt, bg=COR_ALERTA, fg="#FFFFFF",
-                font=("Segoe UI", 34, "bold"), anchor="w", justify="left",
-                wraplength=max(400, self.winfo_screenwidth() - 280)
-            ).pack(fill="x", pady=8)
-
+        # O overlay entra em tela ANTES do conteúdo. Parece detalhe de ordem,
+        # mas é o que dá a _largura_conteudo_alerta() uma largura real para
+        # medir: com o texto montado primeiro, a medida sai de uma janela
+        # ainda sem tamanho final e trunca o nome do cliente.
         if not self._alerta_ativo:
             self._alerta_ativo = True
             self.overlay.place(x=0, y=0, relwidth=1, relheight=1)
             self.overlay.lift()
-            self._piscar_alerta()
+            self._fase_respiracao = 0.0
+            self._respirar_moldura()
+        self.update_idletasks()
+
+        for widget in self.overlay_conteudo.winfo_children():
+            widget.destroy()
+        self._itens_overlay = []
+        self._contrato_em_alerta = str(evento.get("contrato", "")).strip()
+
+        # expand=True sem fill vertical => o bloco fica centralizado na altura
+        bloco = tk.Frame(self.overlay_conteudo, bg=COR_FUNDO)
+        bloco.pack(expand=True, fill="x")
+
+        topo = tk.Frame(bloco, bg=COR_FUNDO)
+        topo.pack(anchor="w")
+        self._rotulo_overlay(
+            topo, espacar_titulo("ALERTA DE GARANTIA"),
+            FONTES_PAINEL.alerta_etiqueta, COR_ALERTA
+        ).pack(side="left")
+        if evento.get("timestamp"):
+            self._rotulo_overlay(
+                topo, evento["timestamp"], FONTES_PAINEL.alerta_etiqueta, COR_TEXTO_MUTED
+            ).pack(side="left", padx=(22, 0))
+
+        self._rotulo_overlay(
+            bloco,
+            encaixar_texto(evento.get("cliente", "N/D"), FONTES_PAINEL.alerta_titulo,
+                           self._largura_conteudo_alerta()),
+            FONTES_PAINEL.alerta_titulo, COR_TEXTO
+        ).pack(anchor="w", pady=(16, 0))
+
+        # uma grade só para as fileiras: assim as colunas ficam alinhadas
+        # entre si em vez de cada fileira medir do seu jeito
+        grade = tk.Frame(bloco, bg=COR_FUNDO)
+        grade.pack(anchor="w", fill="x", pady=(38, 0))
+        for indice in range(4):
+            grade.grid_columnconfigure(indice, weight=1, uniform="alerta")
+
+        self._bloco_overlay(grade, "CONTRATO", evento.get("contrato", "N/D"), coluna=0)
+        self._bloco_overlay(grade, "UNIDADE",
+                            str(evento.get("unidade", "N/D")).upper(),
+                            COR_DESTAQUE, coluna=1)
+        self._bloco_overlay(grade, "BAIRRO", evento.get("bairro", "N/D"), coluna=2)
+
+        cor_status, rotulo_status = ESTADOS_STATUS.get(
+            self._status_do_contrato(self._contrato_em_alerta),
+            ESTADOS_STATUS["VERIFICANDO"]
+        )
+        self._etiqueta_status_alerta = self._bloco_overlay(
+            grade, "CONEXÃO", f"● {rotulo_status}", cor_status, coluna=3
+        )
+
+        # nomes de técnico e tipo de serviço são longos: ganham duas colunas
+        # cada um, senão o valor entra cortado — e aqui nada pode faltar
+        self._bloco_overlay(
+            grade, "TELEFONE(S)",
+            str(evento.get("telefones", "N/D")).replace(",", "   ·   "),
+            linha=1, coluna=0, colunas=2, espaco_acima=34
+        )
+        if evento.get("tecnico_ofs"):
+            self._bloco_overlay(grade, "TÉCNICO OFS", evento["tecnico_ofs"],
+                                COR_ROXO_CLARO, linha=1, coluna=2, colunas=2,
+                                espaco_acima=34)
+        if evento.get("tipo_anterior"):
+            self._bloco_overlay(
+                grade, "SERVIÇO ANTERIOR",
+                f"{evento['tipo_anterior']}  ·  concluído há "
+                f"{evento.get('dias_aging', '?')} dia(s)",
+                COR_ROXO_CLARO, linha=2, coluna=0, colunas=3, espaco_acima=34
+            )
+
+        agora = time.monotonic()
+        self._animar_entrada_alerta(agora)
+        self._animar_barra_tempo(agora)
 
         if self._job_alerta:
             self.after_cancel(self._job_alerta)
         self._job_alerta = self.after(DURACAO_ALERTA_MS, self._ocultar_alerta)
 
-    def _piscar_alerta(self):
+    def _animar_entrada_alerta(self, inicio):
+        duracao = 0.45
+        t = min(1.0, (time.monotonic() - inicio) / duracao)
+        suave = 1 - (1 - t) ** 3
+        for widget, cor_final in self._itens_overlay:
+            try:
+                widget.configure(fg=misturar_cores(COR_FUNDO, cor_final, suave))
+            except tk.TclError:
+                return
+        if t < 1.0:
+            self.after(16, lambda: self._animar_entrada_alerta(inicio))
+
+    def _respirar_moldura(self):
+        """Pulso contínuo da moldura. Interpolado, não ligado/desligado: de
+        longe chama igual e de perto não castiga quem trabalha na sala."""
         if not self._alerta_ativo:
             return
-        self._piscar_estado = not self._piscar_estado
-        cor = COR_ALERTA if self._piscar_estado else COR_ALERTA_ESCURO
+        self._fase_respiracao = (self._fase_respiracao + 0.055) % 1.0
+        onda = (1 - math.cos(self._fase_respiracao * 2 * math.pi)) / 2
+        try:
+            self.overlay.configure(bg=misturar_cores(COR_ALERTA_ESCURO, COR_ALERTA, onda))
+        except tk.TclError:
+            return
+        self._job_respiracao = self.after(40, self._respirar_moldura)
 
-        self.overlay.configure(bg=cor)
-        self.overlay_titulo.configure(bg=cor)
-        self.overlay_corpo.configure(bg=cor)
-        for widget in self.overlay_corpo.winfo_children():
-            try:
-                widget.configure(bg=cor)
-            except Exception:
-                pass
-
-        self.after(INTERVALO_PISKAR_MS, self._piscar_alerta)
+    def _animar_barra_tempo(self, inicio):
+        if not self._alerta_ativo:
+            return
+        restante = 1.0 - min(
+            1.0, (time.monotonic() - inicio) / (DURACAO_ALERTA_MS / 1000.0)
+        )
+        try:
+            self.overlay_barra.place_configure(relwidth=max(0.0, restante))
+        except tk.TclError:
+            return
+        if restante > 0:
+            self._job_barra = self.after(200, lambda: self._animar_barra_tempo(inicio))
 
     def _ocultar_alerta(self):
         self._alerta_ativo = False
+        for job in (self._job_respiracao, self._job_barra):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        self._job_respiracao = None
+        self._job_barra = None
         self.overlay.place_forget()
         self._job_alerta = None
+
+
+def iniciar_threads_do_painel():
+    """Clima e status do Autenticador sobem UMA vez por processo.
+
+    O painel é aberto e fechado várias vezes pelo grupo (/exibirpaineltv e
+    /ocultarpaineltv). Sem esta guarda, ligá-las no __init__ deixaria uma
+    thread órfã a cada abertura.
+    """
+    global _THREADS_PAINEL_INICIADAS
+    if _THREADS_PAINEL_INICIADAS:
+        return
+    _THREADS_PAINEL_INICIADAS = True
+    threading.Thread(target=thread_atualizacao_clima, daemon=True,
+                     name="clima-painel").start()
+    threading.Thread(target=thread_status_autenticador_painel, daemon=True,
+                     name="autenticador-painel").start()
 
 
 def executar_monitoramento(exibir=None):
@@ -4663,7 +5548,7 @@ def executar_monitoramento(exibir=None):
                     "de reconexão). O monitoramento segue parado — pode ser preciso olhar a máquina."
                 )
 
-            reconectar_forticlient()
+            lidar_com_queda_de_vpn()
 
             intervalo_espera_vpn = min(20 + (tentativas_vpn * 5), 120)
             logger.info(f"Aguardando {intervalo_espera_vpn} segundos para a rota estabilizar antes de tentar de novo...")
@@ -5486,12 +6371,23 @@ def executar_monitoramento(exibir=None):
                         break
 
                     if not vpn_esta_conectada():
-                        enviar_alerta_telegram("🔴 ALERTA: Queda de VPN detectada! Iniciando protocolo de reconexão do FortiClient...")
-                        logger.warning("VPN caiu! Reconectando FortiClient...")
+                        if _vpn_e_gerenciada_externamente():
+                            # Linux: nada aqui vai "consertar" a VPN -- só o
+                            # campo-vpn.service faz isso, em processo separado.
+                            # A mensagem não promete o que não sabemos ainda;
+                            # quem confirma de verdade é o laço externo
+                            # (vpn_esta_conectada() lá em cima, antes de abrir
+                            # o navegador de novo).
+                            enviar_alerta_telegram("🔴 ALERTA: Queda de VPN detectada! Fechando a sessão do CAMPO até a rede voltar...")
+                            logger.warning("VPN caiu! Fechando o navegador -- o campo-vpn.service cuida da reconexão.")
+                        else:
+                            enviar_alerta_telegram("🔴 ALERTA: Queda de VPN detectada! Iniciando protocolo de reconexão do FortiClient...")
+                            logger.warning("VPN caiu! Reconectando FortiClient...")
 
-                        reconectar_forticlient()
+                        lidar_com_queda_de_vpn()
 
-                        enviar_alerta_telegram("🟢 VPN restabelecida. Reiniciando o navegador para limpar a sessão do CAMPO...")
+                        if not _vpn_e_gerenciada_externamente():
+                            enviar_alerta_telegram("🟢 VPN restabelecida. Reiniciando o navegador para limpar a sessão do CAMPO...")
                         logger.info("Forçando o encerramento do navegador para relogar no CAMPO...")
                         break
 
@@ -5759,11 +6655,6 @@ def main():
             thread_status_whatsapp.start()
 
             threading.Thread(target=thread_reenvio_alertas_whatsapp, daemon=True).start()
-
-            # Vigia da ponte HTTP do WhatsApp: relança o Node se ele subir
-            # travado (o buraco de 09/08/2026). Fora do laço de monitoramento
-            # de propósito, para agir mesmo se o laço travar.
-            threading.Thread(target=thread_vigia_servico_whatsapp, daemon=True).start()
 
         global TV_ATIVA
         try:
