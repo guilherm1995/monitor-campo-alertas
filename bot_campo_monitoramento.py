@@ -2233,14 +2233,118 @@ def notificar_garantia_telegram(unidade, contrato, nome_cliente, bairro, telefon
     return enviar_alerta_telegram(mensagem, parse_mode="HTML")
 
 
+# ---------------------------------------------------------------------------
+# Vigência dos reparos pendentes
+#
+# A varredura avalia cada reparo UMA vez: quem já está em reparos_avaliados é
+# pulado no laço. Ou seja, ninguém volta a olhar para ele -- e o chamado sendo
+# fechado no CAMPO não deixa rastro nenhum aqui. Como a reavaliação por Base
+# OFS varre TODOS os pendentes, sem esta trava uma planilha nova dispara
+# garantia de O.S. fechada dias atrás, indistinguível de uma legítima.
+#
+# A trava é o conjunto de O.S. de reparo vistas ABERTAS na última varredura
+# completa. Fica só em memória de propósito: é barato, sempre fresco (a
+# varredura roda a cada volta) e não acrescenta escrita a um arquivo que já
+# passa de 5 MB.
+_REPAROS_ABERTOS = {"os": set(), "carimbo": None}
+_TRAVA_REPAROS_ABERTOS = threading.Lock()
+
+# Pendente que não aparece como aberto há mais de N dias é lixo: some do
+# arquivo. Sem isto a lista só cresce -- medida em dois dias seguidos, passou
+# de 2.520 para 4.660 registros -- e cada garantia reescreve tudo isso em
+# disco, porque a gravação é do arquivo inteiro.
+DIAS_PODA_REPARO_PENDENTE = 7
+
+
+def publicar_reparos_abertos(os_ids):
+    """Chamado ao fim de uma varredura COMPLETA, com as O.S. de reparo vistas."""
+    with _TRAVA_REPAROS_ABERTOS:
+        _REPAROS_ABERTOS["os"] = set(os_ids)
+        _REPAROS_ABERTOS["carimbo"] = datetime.now()
+
+
+def reparos_abertos_conhecidos():
+    """(conjunto, carimbo). carimbo=None => nenhuma varredura completa ainda."""
+    with _TRAVA_REPAROS_ABERTOS:
+        return set(_REPAROS_ABERTOS["os"]), _REPAROS_ABERTOS["carimbo"]
+
+
+def podar_reparos_antigos(reparos_avaliados):
+    """Remove pendentes parados há muito tempo. Devolve quantos saíram.
+
+    Só mexe em quem NÃO foi notificado: o registro de uma garantia já enviada
+    tem que viver para sempre, senão a O.S. volta a ser avaliada do zero e a
+    operação recebe a mesma mensagem duas vezes.
+
+    Podar um chamado que por acaso ainda esteja aberto não faz mal: a varredura
+    seguinte o encontra de novo, reavalia e -- aí sim, com ele vivo -- notifica.
+    """
+    limite = datetime.now() - timedelta(days=DIAS_PODA_REPARO_PENDENTE)
+    a_remover = []
+    for chave, info in reparos_avaliados.items():
+        if info.get('notificado', True):
+            continue
+        # visto_em é a última data em que a varredura o encontrou aberto;
+        # quem nunca foi carimbado cai na data de abertura.
+        referencia = info.get('visto_em') or info.get('data_abertura')
+        if not referencia:
+            continue
+        try:
+            quando = datetime.fromisoformat(referencia)
+        except Exception:
+            continue
+        if quando < limite:
+            a_remover.append(chave)
+
+    for chave in a_remover:
+        reparos_avaliados.pop(chave, None)
+    if a_remover:
+        logger.info(
+            f"Poda de reparos pendentes: {len(a_remover)} registro(s) sem sinal de "
+            f"vida há mais de {DIAS_PODA_REPARO_PENDENTE} dias foram removidos "
+            f"({len(reparos_avaliados)} restantes)."
+        )
+    return len(a_remover)
+
+
 def reavaliar_reparos_pendentes(reparos_avaliados):
+    """Reavalia pendentes contra a Base OFS nova. Devolve False se não deu para
+    rodar agora -- nesse caso quem chamou NÃO pode dar a Base como processada."""
+    os_abertas, carimbo = reparos_abertos_conhecidos()
+    if carimbo is None:
+        logger.warning(
+            "Reavaliação da Base OFS adiada: nenhuma varredura completa desde que "
+            "o bot subiu, então não há como saber quais reparos ainda estão "
+            "abertos. Roda assim que a primeira varredura terminar."
+        )
+        return False
+
     pendentes = [
         info for info in reparos_avaliados.values()
         if not info.get('notificado', True) and info.get('codigo_contrato') and info.get('data_abertura')
     ]
     if not pendentes:
         logger.info("Reavaliação da Base OFS: nenhum reparo pendente no momento.")
-        return
+        if podar_reparos_antigos(reparos_avaliados):
+            salvar_reparos_avaliados(reparos_avaliados)
+        return True
+
+    total_pendentes = len(pendentes)
+    pendentes = [i for i in pendentes if str(i.get('os_id')) in os_abertas]
+    ignorados = total_pendentes - len(pendentes)
+    if ignorados:
+        logger.info(
+            f"Reavaliação da Base OFS: {ignorados} pendente(s) fora da lista de "
+            f"chamados abertos (fechados no campo) — não serão notificados."
+        )
+    if not pendentes:
+        # Caso comum daqui para a frente: a Base muda, mas os pendentes que
+        # casariam já foram fechados no campo. Podar AQUI é o que mantém o
+        # arquivo do tamanho da realidade em vez de só crescer.
+        logger.info("Reavaliação da Base OFS: nenhum pendente ainda aberto.")
+        if podar_reparos_antigos(reparos_avaliados):
+            salvar_reparos_avaliados(reparos_avaliados)
+        return True
 
     logger.info(
         f"Reavaliando {len(pendentes)} reparo(s) pendente(s) contra a Base OFS atualizada..."
@@ -2311,6 +2415,10 @@ def reavaliar_reparos_pendentes(reparos_avaliados):
             logger.exception(
                 f"Falha ao reavaliar reparo OS {os_id} contra a Base OFS atualizada."
             )
+
+    if podar_reparos_antigos(reparos_avaliados):
+        salvar_reparos_avaliados(reparos_avaliados)
+    return True
 
 
 def carregar_os_notificadas():
@@ -5705,7 +5813,6 @@ def executar_monitoramento(exibir=None):
                         return
 
                     primeira_leitura = estado_reavaliacao_base_ofs['mtime'] is None
-                    estado_reavaliacao_base_ofs['mtime'] = mtime_atual
                     carregar_base_ofs()
 
                     if primeira_leitura:
@@ -5717,6 +5824,7 @@ def executar_monitoramento(exibir=None):
                         # síncrona, era candidata direta a estourar o vigia de
                         # 900s. A base não mudou desde a última execução; não há
                         # nada para reavaliar aqui.
+                        estado_reavaliacao_base_ofs['mtime'] = mtime_atual
                         logger.info(
                             "Base OFS: leitura inicial registrada para controle de "
                             "reavaliação (nada a reavaliar até o arquivo mudar)."
@@ -5727,7 +5835,12 @@ def executar_monitoramento(exibir=None):
                         "Base OFS: novo arquivo detectado no disco (mtime mudou) — "
                         "recarregando e reavaliando reparos pendentes..."
                     )
-                    reavaliar_reparos_pendentes(reparos_avaliados)
+                    # O mtime só é dado como processado se a reavaliação REALMENTE
+                    # rodou. Ela recusa rodar enquanto não houver uma varredura
+                    # completa para dizer quais chamados seguem abertos; marcar
+                    # antes faria essa Base nova ser esquecida para sempre.
+                    if reavaliar_reparos_pendentes(reparos_avaliados):
+                        estado_reavaliacao_base_ofs['mtime'] = mtime_atual
                 except Exception:
                     logger.exception("Falha ao checar/reavaliar a Base OFS atualizada.")
 
@@ -5769,6 +5882,7 @@ def executar_monitoramento(exibir=None):
                 # volta, e 6s de json.dump travando o laço a cada 25s é o tipo de
                 # coisa que vira "o bot está lento" sem nenhum erro no log.
                 reparos_sujos = False
+                os_reparo_abertas = set()
 
                 for chamado in lista_chamados:
                     # Batida por chamado. Notificar não é instantâneo: cada O.S.
@@ -5865,6 +5979,25 @@ def executar_monitoramento(exibir=None):
                     elif codigo == 'ES05':
                         os_id = chamado.get('id')
                         chave_reparo = str(os_id) if os_id else None
+
+                        if chave_reparo:
+                            # Prova de vida, colhida ANTES do filtro abaixo: um
+                            # reparo já avaliado é pulado dali para a frente, e
+                            # sem carimbar aqui ninguém no sistema saberia que
+                            # ele continua aberto. É o que separa uma garantia
+                            # legítima de uma O.S. fechada semana passada na
+                            # hora em que a Base OFS é atualizada.
+                            os_reparo_abertas.add(chave_reparo)
+                            registro = reparos_avaliados.get(chave_reparo)
+                            if registro is not None:
+                                hoje_iso = datetime.now().date().isoformat()
+                                # data (e não hora): assim o carimbo muda no
+                                # máximo uma vez por dia por registro, em vez
+                                # de sujar 5 MB de JSON a cada volta
+                                if registro.get('visto_em') != hoje_iso:
+                                    registro['visto_em'] = hoje_iso
+                                    reparos_sujos = True
+
                         if chave_reparo and chave_reparo not in reparos_avaliados:
                             try:
                                 data_abertura_ms = chamado.get('dataAbertura')
@@ -5970,6 +6103,13 @@ def executar_monitoramento(exibir=None):
                 # comportamento correto e já é o que o `except` acima promete.
                 if reparos_sujos:
                     salvar_reparos_avaliados(reparos_avaliados)
+
+                # Só uma varredura COMPLETA vale como prova de vida. Publicar
+                # uma lista subcontada faria a reavaliação concluir que
+                # chamados abertos estão fechados, e calar garantia de verdade
+                # -- erro pior que o que esta trava veio consertar.
+                if capex_confiavel:
+                    publicar_reparos_abertos(os_reparo_abertas)
 
                 if capex_confiavel:
                     atualizar_capex_pendente(contagem_capex_pendente_rj, contagem_capex_pendente_sp)
