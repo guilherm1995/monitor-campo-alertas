@@ -4912,6 +4912,7 @@ class PainelTV(tk.Tk):
         FONTES_PAINEL = FontesPainel()
 
         self._em_tela_cheia = False
+        self._tela_conhecida = (self.winfo_screenwidth(), self.winfo_screenheight())
         self._logo_ref = None
         self._job_ajuste = None
         self._job_preaquecer = None
@@ -4941,6 +4942,7 @@ class PainelTV(tk.Tk):
         self._processar_fila()
         self._processar_fila_clima()
         self._processar_fila_status()
+        self._vigiar_geometria()
 
         iniciar_threads_do_painel()
 
@@ -5040,7 +5042,8 @@ class PainelTV(tk.Tk):
 
     def _aplicar_tela_cheia(self):
         self.update_idletasks()
-        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+        tela = (self.winfo_screenwidth(), self.winfo_screenheight())
+        self.geometry(f"{tela[0]}x{tela[1]}+0+0")
         try:
             self.attributes("-fullscreen", True)
         except Exception:
@@ -5049,7 +5052,34 @@ class PainelTV(tk.Tk):
             self.state("zoomed")
         except Exception:
             pass
+        self._tela_conhecida = tela
         self._em_tela_cheia = True
+
+    def _vigiar_geometria(self):
+        """Reage a tela que muda de tamanho DEBAIXO da janela.
+
+        No arranque o X sobe com a tela do notebook, e só depois o script do
+        HDMI passa a TV a primária e desliga a do notebook. Quem abriu em tela
+        cheia antes dessa troca fica com a janela do tamanho antigo — e como
+        nenhum evento avisa que a RESOLUÇÃO mudou (a janela em si não foi
+        redimensionada), o painel ficava com metade do conteúdo fora da tela
+        até alguém reiniciar o bot. Vale para qualquer mexida no HDMI, não só
+        no boot: tirar e recolocar o cabo cai no mesmo caso.
+        """
+        tela = (self.winfo_screenwidth(), self.winfo_screenheight())
+        if tela != self._tela_conhecida:
+            anterior = self._tela_conhecida
+            self._tela_conhecida = tela
+            if self._em_tela_cheia:
+                logger.info(
+                    f"Painel de TV: a tela mudou de {anterior[0]}x{anterior[1]} para "
+                    f"{tela[0]}x{tela[1]}. Reaplicando tela cheia."
+                )
+                self._aplicar_tela_cheia()
+        elif self._em_tela_cheia and self.winfo_width() != tela[0]:
+            # tela cheia pedida mas a janela nao acompanhou (WM atravessado)
+            self._aplicar_tela_cheia()
+        self.after(5000, self._vigiar_geometria)
 
     def _alternar_tela_cheia(self, ligar):
         if ligar:
