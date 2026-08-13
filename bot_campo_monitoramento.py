@@ -472,6 +472,12 @@ def _e_erro_de_contexto_morto(erro):
 
 CST_PERFIL_DIRETORIO = os.path.join(os.getcwd(), "perfil_campo_logistica")
 ARQUIVO_NOTIFICADAS = os.path.join(PASTA_DADOS, "os_notificadas.json")
+# Último agendamento visto por O.S. Existe para enxergar a REMARCAÇÃO: uma
+# O.S. que já foi improdutiva e ganha data nova é reincidência igual, mas
+# entra pela porta de trás -- ela já está em os_notificadas, então o caminho
+# do entrante nunca mais roda para ela. Sem esta memória, o bot só via o
+# primeiro round de cada O.S. e ficava cego para todos os seguintes.
+ARQUIVO_AGENDAMENTOS_VISTOS = os.path.join(PASTA_DADOS, "agendamentos_vistos.json")
 ARQUIVO_HISTORICO_ENTRANTES_CAPEX = os.path.join(PASTA_DADOS, "historico_entrantes_capex.json")
 # Estado do dia EM ANDAMENTO (hoje) dos entrantes CAPEX. Separado do
 # histórico acima porque o histórico só recebe um dia inteiro quando ele
@@ -2299,14 +2305,23 @@ def verificar_improdutiva_anterior(contrato, nome_cliente, data_abertura):
 
 
 def notificar_improdutiva_telegram(unidade, contrato, nome_cliente, bairro,
-                                   telefones_str, achado):
+                                   telefones_str, achado, agendamento=None):
+    """Aviso de reincidência. Com `agendamento`, é uma REMARCAÇÃO.
+
+    O título separa os dois casos de propósito: no grupo, "entrou uma O.S. de
+    quem já deu improdutiva" e "remarcaram a O.S. que deu improdutiva" pedem
+    reações diferentes, e quem lê decide pela primeira linha.
+    """
+    titulo = "REMARCADA APÓS IMPRODUTIVA" if agendamento else "IMPRODUTIVA ANTERIOR"
     linhas = [
-        f"IMPRODUTIVA ANTERIOR: {html.escape(str(unidade))}",
+        f"{titulo}: {html.escape(str(unidade))}",
         f"• Contrato: {html.escape(str(contrato))}",
         f"• Cliente: {html.escape(str(nome_cliente))}",
         f"• Bairro: {html.escape(str(bairro))}",
         f"• Telefone(s): {telefones_str}",
     ]
+    if agendamento:
+        linhas.append(f"• Novo agendamento: {html.escape(str(agendamento))}")
 
     quando = achado['data'].strftime('%d/%m')
     dias = achado['dias']
@@ -2330,6 +2345,99 @@ def notificar_improdutiva_telegram(unidade, contrato, nome_cliente, bairro,
         linhas.append(f"• OS anterior: {html.escape(str(achado['os']))}")
 
     return enviar_alerta_telegram(f"<b>{chr(10).join(linhas)}</b>", parse_mode="HTML")
+
+
+def _data_agendamento(valor):
+    """Data do agendamento -> datetime, ou None.
+
+    O CAMPO manda 'agendamentoData' como TEXTO 'AAAA-MM-DD' (conferido em
+    13/08/2026 na amostra de produção) -- diferente de 'dataAbertura', que vem
+    em epoch de milissegundos. Os dois formatos são aceitos aqui porque o
+    campo não é lido por mais ninguém no sistema: se um dia a API trocar a
+    representação, isto continua entendendo em vez de emudecer o aviso.
+    """
+    if not valor:
+        return None
+    texto = str(valor).strip()
+    try:
+        return datetime.strptime(texto[:10], '%Y-%m-%d')
+    except ValueError:
+        pass
+    try:
+        return datetime.fromtimestamp(float(texto) / 1000)
+    except Exception:
+        return None
+
+
+def acompanhar_remarcacao(chamado, os_id, unidade, agendamentos_vistos):
+    """Avisa quando remarcam uma O.S. que já foi improdutiva.
+
+    Só notificar o entrante deixava um buraco: a O.S. entra, alguém vê o
+    aviso, o técnico vai e volta improdutivo, remarcam -- e a remarcação, que
+    é a reincidência de verdade, não gerava aviso nenhum, porque a O.S. já
+    estava em os_notificadas e o ramo do entrante nunca mais roda para ela.
+
+    A PRIMEIRA vez que uma O.S. aparece aqui nunca alerta, só registra. Isso
+    vale tanto para a O.S. que acabou de entrar (o aviso de entrante já saiu
+    logo acima, e dois seguidos seriam ruído) quanto para as que já estavam
+    em campo quando esta função passou a existir -- sem essa regra, a
+    primeira varredura depois de publicar despejaria uma remarcação falsa
+    para cada O.S. aberta do litoral e do RJ de uma vez só.
+
+    Devolve True se o registro mudou. NÃO grava em disco: quem chama junta as
+    mudanças e grava uma vez por varredura. Gravar aqui custaria o arquivo
+    inteiro reescrito a cada O.S. -- e é exatamente na primeira varredura,
+    quando TODAS são novidade, que isso seria pior.
+    """
+    chave = str(os_id)
+    agendamento = chamado.get('agendamentoData')
+    agora = str(agendamento or '')
+
+    anterior = agendamentos_vistos.get(chave)
+    if anterior == agora:
+        return False
+
+    agendamentos_vistos[chave] = agora
+
+    # Primeira vez que vemos esta O.S., ou remarcação para "sem data" (o
+    # agendamento foi apagado): registra e cala.
+    if anterior is None or not agora:
+        return True
+
+    contrato = chamado.get('codigoContrato', 'N/D')
+    nome_cliente = chamado.get('nomeCliente', 'N/D')
+    if isinstance(nome_cliente, str):
+        nome_cliente = nome_cliente.strip() or 'N/D'
+
+    # A janela de 30 dias conta a partir da data NOVA, não da abertura da
+    # O.S.: o que interessa é se houve improdutiva perto da visita que vão
+    # fazer agora. Uma O.S. aberta há dois meses e remarcada para amanhã
+    # continua valendo a conferida.
+    quando = _data_agendamento(agendamento) or datetime.now()
+
+    achado = verificar_improdutiva_anterior(contrato, nome_cliente, quando)
+    if not achado:
+        return True
+
+    cidade = (chamado.get('enderecoCidade') or '').strip() or unidade
+    bairro = chamado.get('enderecoBairro', 'N/D')
+    telefones, _ = extrair_telefones_do_chamado(chamado)
+    telefones_str = ", ".join(telefones) if telefones else "N/D"
+
+    data_nova = _data_agendamento(agendamento)
+    agendamento_txt = data_nova.strftime('%d/%m') if data_nova else str(agendamento)
+
+    if notificar_improdutiva_telegram(cidade, contrato, nome_cliente, bairro,
+                                      telefones_str, achado,
+                                      agendamento=agendamento_txt) is not None:
+        registrar_improdutiva_notificada()
+        logger.warning(
+            f"REMARCADA APÓS IMPRODUTIVA: OS {os_id} ({nome_cliente}) "
+            f"— novo agendamento {agendamento_txt}, casou por "
+            f"{achado['casou_por']} com '{achado['motivo']}' de "
+            f"{achado['dias']} dia(s) atrás."
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2536,6 +2644,35 @@ def salvar_os_notificadas(os_ids):
         salvar_json_atomico(ARQUIVO_NOTIFICADAS, ids_salvaveis)
     except Exception:
         logger.exception("Não foi possível persistir os_notificadas no arquivo local.")
+
+
+def carregar_agendamentos_vistos():
+    """{os_id: último agendamento visto}. Chave e valor viram texto: o JSON
+    não guarda inteiro como chave, e comparar tipos diferentes daria remarcação
+    falsa a cada reinício."""
+    if os.path.exists(ARQUIVO_AGENDAMENTOS_VISTOS):
+        try:
+            with open(ARQUIVO_AGENDAMENTOS_VISTOS, 'r') as f:
+                dados = json.load(f)
+            if isinstance(dados, dict):
+                return {str(k): str(v) for k, v in dados.items()}
+        except Exception:
+            logger.exception(
+                "Não foi possível carregar agendamentos_vistos.json, iniciando vazio.")
+    return {}
+
+
+def salvar_agendamentos_vistos(vistos):
+    # Mesmo teto de os_notificadas, e pela mesma razão: o arquivo cresce a cada
+    # O.S. nova e nada o poda. Corta pelas mais antigas (dict preserva ordem de
+    # inserção), então o que sobrevive é o que ainda está em campo.
+    if len(vistos) > 5000:
+        for chave in list(vistos)[:len(vistos) - 5000]:
+            vistos.pop(chave, None)
+    try:
+        salvar_json_atomico(ARQUIVO_AGENDAMENTOS_VISTOS, vistos)
+    except Exception:
+        logger.exception("Não foi possível persistir agendamentos_vistos no arquivo local.")
 
 
 # =========================================
@@ -5835,10 +5972,12 @@ def iniciar_threads_do_painel():
 
 def executar_monitoramento(exibir=None):
     os_notificadas = carregar_os_notificadas()
+    agendamentos_vistos = carregar_agendamentos_vistos()
     reparos_avaliados = carregar_reparos_avaliados()
     qtd_reparos_notificados = sum(1 for info in reparos_avaliados.values() if info.get('notificado'))
     qtd_reparos_pendentes = len(reparos_avaliados) - qtd_reparos_notificados
     logger.info(f"{len(os_notificadas)} OS já notificadas anteriormente.")
+    logger.info(f"{len(agendamentos_vistos)} OS com agendamento já conhecido.")
     logger.info(
         f"{qtd_reparos_notificados} Reparos já confirmados e notificados como garantia anteriormente "
         f"({qtd_reparos_pendentes} pendente(s) de reavaliação contra a Base OFS)."
@@ -6110,6 +6249,11 @@ def executar_monitoramento(exibir=None):
                 # volta, e 6s de json.dump travando o laço a cada 25s é o tipo de
                 # coisa que vira "o bot está lento" sem nenhum erro no log.
                 reparos_sujos = False
+                # Mesma razão do reparos_sujos acima, e o caso aqui é ainda mais
+                # agudo: na PRIMEIRA varredura depois de publicar, toda O.S.
+                # aberta é novidade -- ou seja, o pior caso do "1 gravação por
+                # chamado" acontece logo de saída, justamente uma vez.
+                agendamentos_mudaram = False
                 os_reparo_abertas = set()
 
                 for chamado in lista_chamados:
@@ -6234,6 +6378,21 @@ def executar_monitoramento(exibir=None):
                                 logger.exception(
                                     f"Falha ao processar/notificar chamado CAPEX OS {os_id}. "
                                     "Será reavaliado no próximo ciclo."
+                                )
+
+                        # Fora do "if os_id not in os_notificadas" de propósito:
+                        # a remarcação acontece justamente DEPOIS de a O.S. já
+                        # ter sido notificada, que é o caso em que aquele ramo
+                        # nunca mais roda.
+                        if os_id:
+                            try:
+                                if acompanhar_remarcacao(
+                                    chamado, os_id, unidade, agendamentos_vistos
+                                ):
+                                    agendamentos_mudaram = True
+                            except Exception:
+                                logger.exception(
+                                    f"Falha ao acompanhar remarcação da OS {os_id}."
                                 )
 
                     elif codigo == 'ES05':
@@ -6363,6 +6522,9 @@ def executar_monitoramento(exibir=None):
                 # comportamento correto e já é o que o `except` acima promete.
                 if reparos_sujos:
                     salvar_reparos_avaliados(reparos_avaliados)
+
+                if agendamentos_mudaram:
+                    salvar_agendamentos_vistos(agendamentos_vistos)
 
                 # Só uma varredura COMPLETA vale como prova de vida. Publicar
                 # uma lista subcontada faria a reavaliação concluir que
