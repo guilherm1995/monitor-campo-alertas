@@ -3468,7 +3468,7 @@ def alerta_critico_telegram(mensagem):
 # ---------------------------------------------------------------------
 # Duas pontes com o site que roda na mesma máquina:
 #
-#   1) comando /painel  -> responde no grupo com o endereço e o PIN, e
+#   1) comando /painel  -> responde no grupo com o endereço do site, e
 #      sobe o site sozinho se ele não estiver no ar. Resolve o endereço
 #      público mudar a cada reinício: quem precisar pede /painel.
 #
@@ -3557,7 +3557,7 @@ def painel_iniciar_site():
 
 
 def montar_mensagem_painel():
-    """Resposta do /painel: sobe o site se preciso e devolve endereço + PIN."""
+    """Resposta do /painel: sobe o site se preciso e devolve o endereço."""
     endereco = _painel_ler_json("painel_endereco.json") or {}
     config = _painel_ler_json("painel_config.json") or {}
     local = endereco.get("local") or f"http://localhost:{config.get('porta', 8800)}"
@@ -3598,11 +3598,16 @@ def montar_mensagem_painel():
         linhas.append("🌐 Sem endereço externo agora (o túnel não subiu).")
     if endereco.get("rede_local"):
         linhas.append(f"🏠 Na rede da empresa: {endereco['rede_local']}")
+    # O PIN único saiu de cena: agora cada pessoa entra com o próprio e-mail,
+    # pela conta Google ou por senha que ela mesma define. Não há mais segredo
+    # compartilhado para anunciar aqui -- e anunciar um que não abre mais nada
+    # seria pior do que não dizer nada.
     linhas += [
         "",
-        f"🔑 PIN: {endereco.get('pin', '(não informado)')}",
+        "🔐 Entre com o seu e-mail. No primeiro acesso, o site envia um código "
+        "para você criar a sua senha.",
         "",
-        "_O endereço muda quando o site reinicia — peça /painel de novo se falhar._",
+        "_Sem acesso? Peça a um administrador para cadastrar o seu e-mail._",
     ]
     return "\n".join(linhas)
 
@@ -3623,7 +3628,7 @@ def montar_mensagem_comandos(whatsapp=False):
         f"     _{barra}backlog {tipos}_ para um tipo só",
         f"🌡️ *{barra}termometro* — termômetro de entrantes CAPEX",
         "📡 *​/autenticador* — consulta status de um contrato",
-        "🖥️ *​/painel* — endereço e PIN do site do painel",
+        "🖥️ *​/painel* — endereço do site do painel",
         "🔄 *​/reiniciar* — reinicia a máquina inteira (VPN, bot, site, painel)",
     ]
     if whatsapp:
