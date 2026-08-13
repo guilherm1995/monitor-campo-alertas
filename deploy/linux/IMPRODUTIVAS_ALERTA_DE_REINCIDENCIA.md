@@ -7,11 +7,25 @@
 
 ## 1. O que o bot faz
 
-A cada entrante de **CAPEX** notificado no grupo, ele pergunta:
+Ele pergunta, em **dois** momentos:
 
 > este contrato — ou este nome — já teve uma improdutiva nos últimos 30 dias?
 
-Se já teve, sai uma segunda mensagem logo depois da de CAPEX:
+| Quando | Título da mensagem |
+|---|---|
+| Uma O.S. de CAPEX **entra** | `IMPRODUTIVA ANTERIOR` |
+| Uma O.S. já conhecida ganha **agendamento novo** | `REMARCADA APÓS IMPRODUTIVA` |
+
+O segundo caso entrou em **13/08/2026**, por correção da operação. Só o
+entrante não bastava: o técnico vai, volta improdutivo, remarcam — e a
+remarcação **é** a reincidência, mas passava calada, porque a O.S. já estava
+em `os_notificadas` e o ramo do entrante nunca mais roda para ela. O bot só
+enxergava o primeiro round de cada O.S.
+
+Que a mesma O.S. volta é visível na própria base: no arquivo de 13/08 a O.S.
+`12180211` aparece duas vezes, uma `cancelado` e outra `suspenso`.
+
+### O aviso do entrante
 
 ```
 IMPRODUTIVA ANTERIOR: CGT
@@ -34,6 +48,41 @@ Quando o casamento vem pelo **nome**, a linha muda para
 nome não é, e quem lê precisa saber quanto confiar antes de agir.
 
 A linha `Improdutivas na janela: N` só aparece quando há mais de uma.
+
+### O aviso da remarcação
+
+Mesma mensagem, com o título trocado e uma linha a mais:
+
+```
+REMARCADA APÓS IMPRODUTIVA: CGT
+• Contrato: 908088
+• Cliente: FULANO DE TAL
+• Bairro: BALNEARIO DOS GOLFINHOS
+• Telefone(s): 12997680556
+• Novo agendamento: 20/08
+• Anterior: Problema de infraestrutura em 25/07 (há 26 dias)
+• Casou por: contrato
+```
+
+O título separa os dois de propósito: "entrou uma O.S. de quem já deu
+improdutiva" e "remarcaram a O.S. que deu improdutiva" pedem reações
+diferentes, e quem lê no grupo decide pela primeira linha.
+
+Aqui a janela de 30 dias conta a partir da **data nova**, não da abertura da
+O.S.: o que interessa é se houve improdutiva perto da visita que vão fazer
+agora. Uma O.S. aberta há dois meses e remarcada para amanhã continua
+valendo a conferida.
+
+**A primeira vez que uma O.S. aparece nunca gera aviso de remarcação, só
+registro.** Vale para a que acabou de entrar (o aviso de entrante já saiu, e
+dois seguidos seriam ruído) e para as que já estavam em campo quando o
+recurso foi publicado — sem essa regra, a primeira varredura despejaria uma
+remarcação falsa para cada O.S. aberta do litoral e do RJ de uma vez só.
+
+O que o bot lembra fica em `<bot>/dados/agendamentos_vistos.json`
+(`{os_id: último agendamento visto}`). **Apagar esse arquivo não gera
+enxurrada**: sem ele, toda O.S. volta a ser "primeira vez" e o bot fica
+quieto até a próxima remarcação de verdade.
 
 ---
 
@@ -182,7 +231,11 @@ Na ordem:
    filtrada (ver seção 4).
 3. **Motivos fora das tabelas?** Mesmo log, seção 5.
 4. **O contador do dia:** mande `/status` no grupo — tem a linha
-   "Improdutivas notificadas hoje".
+   "Improdutivas notificadas hoje". Ela soma os dois tipos de aviso.
+5. **Só a remarcação parou?** Procure no log
+   `OS com agendamento já conhecido`. Se vier `0` toda vez que o bot sobe, o
+   `agendamentos_vistos.json` não está sendo gravado — e aí toda O.S. é
+   sempre "primeira vez", que nunca alerta.
 
 ---
 
@@ -210,5 +263,7 @@ respondem a única pergunta que interessa agora.
 | Regra, tabelas e índice | `bot/improdutivas.py` |
 | Consulta e mensagem | `bot/bot_campo_monitoramento.py` (`verificar_improdutiva_anterior`, `notificar_improdutiva_telegram`) |
 | Gancho no entrante | mesmo arquivo, no bloco `if codigo in CODIGOS_ALVO` |
+| Gancho na remarcação | mesmo bloco, `acompanhar_remarcacao` — **fora** do `if os_id not in os_notificadas`, que é o ponto todo |
+| Memória do agendamento | `<bot>/dados/agendamentos_vistos.json` |
 | Registro da planilha | `site/web/fontes/planilhas.py` (`ARQUIVOS`, `ESPELHADOS_NO_BOT`) |
 | Aviso de base faltando | `site/web/config.py` (`problemas()`) |
