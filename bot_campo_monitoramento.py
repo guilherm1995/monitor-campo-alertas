@@ -59,7 +59,7 @@ from amostra_chamados import salvar_amostra_chamados, salvar_diagnostico_plano
 
 # ============ MODIFICADO: importar também a nova função ============
 from backlog_envio import gerar_e_enviar_backlog, gerar_e_enviar_backlog_tipo, configurar_telegram
-from improdutivas import analisar_improdutivas, formatar_mensagens_whatsapp
+import improdutivas
 
 try:
     import win32gui, win32con
@@ -205,14 +205,12 @@ TIMEOUT_AGUARDANDO_CONTRATO_AUTENTICADOR_SEG = 5 * 60
 # "espera" independente, em vez de compartilhar o estado do chat inteiro).
 AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP = {}
 
-# ================= IMPRODUTIVAS (relatório OFS via CSV no grupo) =================
-# Mesmo esquema do AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP acima: chaveado pelo
-# participante, pra várias pessoas poderem usar /improdutivas ao mesmo tempo
-# sem se atrapalhar. O timeout é maior que o do /autenticador (10 min em vez de 5)
-# porque encontrar e anexar o CSV do OFS costuma levar mais tempo do que
-# digitar um número de contrato.
-AGUARDANDO_ARQUIVO_IMPRODUTIVAS_WHATSAPP = {}
-TIMEOUT_AGUARDANDO_ARQUIVO_IMPRODUTIVAS_SEG = 10 * 60
+# O /improdutivas foi aposentado em 13/08/2026. Era um relatório de lote:
+# alguém mandava o comando, anexava o CSV do OFS no grupo e recebia listas por
+# região. Não tinha memória e não cruzava com nada -- analisava e esquecia.
+# No lugar dele, a mesma classificação de motivos passou a rodar sozinha, a
+# cada entrante, contra a base de 30 dias (ver improdutivas.py e
+# verificar_improdutiva_anterior).
 
 # Guarda a última lista de chamados buscada da API do CAMPO (atualizada a cada
 # ciclo do loop de monitoramento). O agendador horário do backlog de CAPEX e
@@ -305,6 +303,15 @@ for _pasta in (PASTA_DADOS, PASTA_LOGS, PASTA_RELATORIOS, PASTA_ASSETS):
     os.makedirs(_pasta, exist_ok=True)
 
 BASE_OFS_ARQUIVO = os.path.join(PASTA_DADOS, "base OFS ok.xlsx")
+
+# Base das improdutivas -- arquivo SEPARADO da base OFS, de propósito. A base
+# OFS é a exportação só de atividades concluídas e é dela que sai a garantia;
+# misturar as improdutivas ali significaria mexer numa base crítica que já
+# funciona. Esta aqui é a exportação dos últimos 30 dias SEM o filtro de
+# status, e serve a uma pergunta só: este entrante já foi improdutiva antes?
+# Sobe pelo site, como a outra, e chega aqui espelhada (ver planilhas.py).
+BASE_IMPRODUTIVAS_ARQUIVO = os.path.join(PASTA_DADOS, "base improdutivas 30 dias.xlsx")
+
 DIAS_GARANTIA_REPARO = 30
 DIAS_GARANTIA_ATIVACAO_MUDANCA = 15
 ARQUIVO_REPAROS_AVALIADOS = os.path.join(PASTA_DADOS, "reparos_avaliados.json")
@@ -998,6 +1005,7 @@ def _carregar_estado_estatisticas_status():
         'capex_pendente_litoral_sp': 0,
         'capex_notificadas_hoje': 0,
         'garantias_notificadas_hoje': 0,
+        'improdutivas_notificadas_hoje': 0,
         'erros_log_hoje': 0,
         'os_analisadas_hoje': 0,
         'inicio_contagem_ts': time.time(),
@@ -1037,6 +1045,7 @@ def _resetar_stats_diarias_se_necessario():
         ESTATISTICAS_STATUS['data_referencia'] = hoje
         ESTATISTICAS_STATUS['capex_notificadas_hoje'] = 0
         ESTATISTICAS_STATUS['garantias_notificadas_hoje'] = 0
+        ESTATISTICAS_STATUS['improdutivas_notificadas_hoje'] = 0
         ESTATISTICAS_STATUS['erros_log_hoje'] = 0
         ESTATISTICAS_STATUS['os_analisadas_hoje'] = 0
         ESTATISTICAS_STATUS['inicio_contagem_ts'] = time.time()
@@ -1054,6 +1063,15 @@ def registrar_garantia_notificada():
     with _stats_lock:
         _resetar_stats_diarias_se_necessario()
         ESTATISTICAS_STATUS['garantias_notificadas_hoje'] += 1
+        _salvar_estado_estatisticas_status()
+
+
+def registrar_improdutiva_notificada():
+    with _stats_lock:
+        _resetar_stats_diarias_se_necessario()
+        ESTATISTICAS_STATUS['improdutivas_notificadas_hoje'] = (
+            ESTATISTICAS_STATUS.get('improdutivas_notificadas_hoje', 0) + 1
+        )
         _salvar_estado_estatisticas_status()
 
 
@@ -1088,6 +1106,7 @@ def montar_mensagem_status():
         capex_sp = ESTATISTICAS_STATUS['capex_pendente_litoral_sp']
         capex_notif = ESTATISTICAS_STATUS['capex_notificadas_hoje']
         garantias_notif = ESTATISTICAS_STATUS['garantias_notificadas_hoje']
+        improdutivas_notif = ESTATISTICAS_STATUS.get('improdutivas_notificadas_hoje', 0)
         erros = ESTATISTICAS_STATUS['erros_log_hoje']
         os_analisadas = ESTATISTICAS_STATUS['os_analisadas_hoje']
         inicio_ts = ESTATISTICAS_STATUS['inicio_contagem_ts']
@@ -1111,6 +1130,7 @@ def montar_mensagem_status():
         f"CAPEX pendente LITORAL NORTE SP: {capex_sp}\n"
         f"CAPEX notificadas hoje: {capex_notif}\n"
         f"Garantias notificadas hoje: {garantias_notif}\n"
+        f"Improdutivas notificadas hoje: {improdutivas_notif}\n"
         f"Erros registrados no LOG hoje: {erros}\n"
         f"TOTAL de O.S analisadas por minuto: {os_por_minuto:.1f}"
     )
@@ -2237,6 +2257,79 @@ def notificar_garantia_telegram(unidade, contrato, nome_cliente, bairro, telefon
     )
     mensagem = f"<b>{corpo_mensagem}</b>"
     return enviar_alerta_telegram(mensagem, parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# Reincidência de improdutiva técnica
+#
+# Pergunta feita a cada entrante de CAPEX: este cliente já teve uma
+# improdutiva nos últimos 30 dias? Se já teve, a visita que está entrando
+# tende a ser a mesma história de novo -- e quem vai a campo merece saber
+# disso antes de sair.
+#
+# Nem toda improdutiva conta. A régua não é a origem (TÉCNICA/COMERCIAL/
+# CLIENTE) e sim se aquela visita perdida diz algo sobre a próxima:
+# remarcação, cliente ausente, chuva e falta de material não dizem, e estão
+# na MOTIVOS_SEM_ALERTA de improdutivas.py.
+#
+# A regra casa por contrato OU por nome (decisão de 13/08/2026; o endereço
+# ficou de fora porque o número da rua só existe dentro de ordemServicos[] de
+# um lado e grudado num texto único do outro). A classificação do motivo é a
+# mesma tabela do antigo /improdutivas -- ver improdutivas.py.
+# ---------------------------------------------------------------------------
+def verificar_improdutiva_anterior(contrato, nome_cliente, data_abertura):
+    """Devolve o registro da improdutiva anterior que merece aviso, ou None.
+
+    Nunca levanta: uma base ausente, corrompida ou com coluna faltando não
+    pode derrubar a notificação do entrante, que é o alerta principal. Falhar
+    aqui custa um aviso a menos; falhar lá custa uma OS que ninguém viu.
+    """
+    if not PANDAS_DISPONIVEL:
+        return None
+    try:
+        return improdutivas.consultar(
+            BASE_IMPRODUTIVAS_ARQUIVO, contrato, nome_cliente, data_abertura
+        )
+    except Exception:
+        logger.exception(
+            "Falha ao consultar a base de improdutivas. O entrante segue "
+            "sendo notificado normalmente, só sem este aviso."
+        )
+        return None
+
+
+def notificar_improdutiva_telegram(unidade, contrato, nome_cliente, bairro,
+                                   telefones_str, achado):
+    linhas = [
+        f"IMPRODUTIVA ANTERIOR: {html.escape(str(unidade))}",
+        f"• Contrato: {html.escape(str(contrato))}",
+        f"• Cliente: {html.escape(str(nome_cliente))}",
+        f"• Bairro: {html.escape(str(bairro))}",
+        f"• Telefone(s): {telefones_str}",
+    ]
+
+    quando = achado['data'].strftime('%d/%m')
+    dias = achado['dias']
+    quando_txt = "hoje" if dias == 0 else ("ontem" if dias == 1 else f"há {dias} dias")
+    linhas.append(
+        f"• Anterior: {html.escape(str(achado['motivo']))} em {quando} ({quando_txt})"
+    )
+
+    if achado['casou_por'] == 'contrato':
+        linhas.append("• Casou por: contrato")
+    else:
+        # Nome é chave fraca: homônimo existe, e quem lê precisa saber que
+        # este alerta pede uma conferida antes de virar decisão.
+        linhas.append("• Casou por: NOME (confira — pode ser homônimo)")
+
+    if achado.get('quantas', 1) > 1:
+        linhas.append(f"• Improdutivas na janela: {achado['quantas']}")
+    if achado.get('tecnico'):
+        linhas.append(f"• Técnico anterior: {html.escape(str(achado['tecnico']))}")
+    if achado.get('os'):
+        linhas.append(f"• OS anterior: {html.escape(str(achado['os']))}")
+
+    return enviar_alerta_telegram(f"<b>{chr(10).join(linhas)}</b>", parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
@@ -3631,9 +3724,7 @@ def montar_mensagem_comandos(whatsapp=False):
         "🖥️ *​/painel* — endereço do site do painel",
         "🔄 *​/reiniciar* — reinicia a máquina inteira (VPN, bot, site, painel)",
     ]
-    if whatsapp:
-        linhas.append("📎 *​/improdutivas* — análise do relatório OFS (envie o CSV depois)")
-    else:
+    if not whatsapp:
         linhas.append("⚙️ *​/status* — resumo do sistema e contadores do dia")
 
     if monitor_pausado():
@@ -4005,48 +4096,6 @@ def _obter_comando_whatsapp(texto):
     return primeira_palavra.split('@')[0].lower()
 
 
-def processar_comando_improdutivas_whatsapp(arquivo):
-    """Recebe o dict {"nome": ..., "caminho": ...} de um arquivo baixado pelo
-    serviço Node (ver index.js), valida que é um CSV, roda a análise de
-    improdutivas e manda o resultado de volta pro grupo, uma mensagem por
-    região (Litoral Norte SP / Sul RJ)."""
-    caminho = (arquivo or {}).get("caminho")
-    nome = (arquivo or {}).get("nome") or "arquivo"
-
-    if not caminho or not os.path.exists(caminho):
-        enviar_alerta_whatsapp_grupo(
-            "⚠️ Não consegui localizar o arquivo recebido. Tente novamente com /improdutivas."
-        )
-        return
-
-    if not nome.lower().endswith(".csv"):
-        enviar_alerta_whatsapp_grupo(
-            f"⚠️ Esperava um arquivo .csv do relatório OFS, recebi \"{nome}\". "
-            f"Envie /improdutivas de novo e anexe o CSV."
-        )
-        return
-
-    try:
-        resultado = analisar_improdutivas(caminho)
-    except ValueError as e:
-        # Erros "esperados" (coluna faltando, arquivo vazio etc.) -- mensagem
-        # já vem pronta pra mostrar ao usuário, sem stack trace.
-        enviar_alerta_whatsapp_grupo(f"⚠️ {e}")
-        return
-    except Exception:
-        logger.exception("Falha inesperada ao analisar arquivo de improdutivas.")
-        enviar_alerta_whatsapp_grupo(
-            "⚠️ Erro inesperado ao analisar o arquivo. Tente novamente com /improdutivas."
-        )
-        return
-
-    try:
-        for mensagem in formatar_mensagens_whatsapp(resultado):
-            enviar_alerta_whatsapp_grupo(mensagem)
-            time.sleep(1.5)  # evita rajada de mensagens muito próximas
-    except Exception:
-        logger.exception("Falha ao enviar o resultado de improdutivas pro grupo do WhatsApp.")
-
 
 def escutar_comandos_whatsapp():
     logger.info("Thread de escuta de comandos do WhatsApp iniciada (aguardando '/autenticador' no grupo)...")
@@ -4069,24 +4118,12 @@ def escutar_comandos_whatsapp():
                 if not remetente or (not texto_bruto and not arquivo):
                     continue
 
-                # Arquivo anexado (ex: CSV do OFS) -- só nos interessa se tem
-                # alguém esperando esse arquivo por causa do /improdutivas.
-                # Tratado antes do resto pra não cair no parser de comando de
-                # texto (mensagens com anexo têm texto="" do lado do Node).
+                # Anexo no grupo não é mais assunto do bot: o único comando que
+                # esperava arquivo era o /improdutivas, aposentado em
+                # 13/08/2026. As bases agora entram pelo site. Segue ignorando
+                # explicitamente para não cair no parser de comando de texto
+                # (mensagem com anexo chega com texto="" do lado do Node).
                 if arquivo:
-                    ts_prompt = AGUARDANDO_ARQUIVO_IMPRODUTIVAS_WHATSAPP.pop(remetente, None)
-                    if ts_prompt is not None:
-                        if (time.time() - ts_prompt) <= TIMEOUT_AGUARDANDO_ARQUIVO_IMPRODUTIVAS_SEG:
-                            enviar_alerta_whatsapp_grupo("⏳ Recebi o arquivo, analisando as improdutivas...")
-                            threading.Thread(
-                                target=processar_comando_improdutivas_whatsapp,
-                                args=(arquivo,),
-                                daemon=True,
-                            ).start()
-                        else:
-                            enviar_alerta_whatsapp_grupo(
-                                "⏱️ Tempo para enviar o arquivo expirou. Envie /improdutivas novamente."
-                            )
                     continue
 
                 comando = _obter_comando_whatsapp(texto_bruto)
@@ -4187,15 +4224,6 @@ def escutar_comandos_whatsapp():
                         target=lambda: enviar_alerta_whatsapp_grupo(montar_mensagem_painel()),
                         daemon=True,
                     ).start()
-                    continue
-
-                # ============ NOVO: /improdutivas (análise do relatório OFS) ============
-                if comando == "/improdutivas":
-                    logger.info("Comando /improdutivas recebido no grupo do WhatsApp. Aguardando arquivo CSV...")
-                    AGUARDANDO_ARQUIVO_IMPRODUTIVAS_WHATSAPP[remetente] = time.time()
-                    enviar_alerta_whatsapp_grupo(
-                        "📎 Envie o arquivo OFS (CSV) do dia anterior anexado aqui no grupo."
-                    )
                     continue
 
                 # ============ MODIFICADO: suporte a subcomandos "backlog" ============
@@ -5013,6 +5041,78 @@ class Cartao(tk.Canvas):
         super().destroy()
 
 
+# --------------------- tamanho real da tela (X11) -------------------------
+# Estado da conexão própria com o X. Aberta uma vez e reaproveitada: o vigia
+# da geometria pergunta a cada 5s, e abrir/fechar conexão nesse ritmo seria
+# desperdício. Fica tudo em None no Windows, onde nada disto existe.
+_x11 = None
+_x11_display = None
+_x11_indisponivel = False
+
+
+def _abrir_x11():
+    """Conexão própria com o X, só para ler a geometria da raiz."""
+    global _x11, _x11_display, _x11_indisponivel
+    if _x11_indisponivel or _x11_display is not None:
+        return _x11_display
+    if not sys.platform.startswith("linux"):
+        _x11_indisponivel = True
+        return None
+    try:
+        lib = ctypes.CDLL("libX11.so.6")
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XDefaultRootWindow.restype = ctypes.c_ulong
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        display = lib.XOpenDisplay(None)
+        if not display:
+            raise RuntimeError("XOpenDisplay devolveu nulo")
+        _x11, _x11_display = lib, display
+        return _x11_display
+    except Exception as e:
+        logger.warning(f"Painel de TV: sem acesso ao X para medir a tela ({e}). "
+                       "Vai usar a medida do Tk.")
+        _x11_indisponivel = True
+        return None
+
+
+def tamanho_real_da_tela(janela):
+    """Tamanho da tela AGORA — não o que o Tk anotou quando conectou.
+
+    `winfo_screenwidth()` devolve o valor que o Xlib gravou na abertura da
+    conexão. Quando o xrandr muda a resolução DEPOIS disso, esse número não
+    acompanha: o Xlib só o corrige se o cliente pedir (XRRUpdateConfiguration)
+    ao receber o evento do RANDR, e o Tk não escuta RANDR.
+
+    Foi assim que o painel ficou 2732x768 numa tela de 1366x768 — o dobro da
+    largura, com a coluna de GARANTIAS e o relógio desenhados fora da tela.
+    E o vigia de geometria não viu problema nenhum porque estava comparando o
+    valor velho com ele mesmo: os dois lados da conta vinham da mesma medida
+    congelada. Vigia que mede com a régua errada jura que está tudo certo.
+
+    A janela RAIZ do X é a fonte de verdade: ela é redimensionada de fato
+    quando o modo muda. Fora do X11, ou se a leitura falhar, cai no Tk.
+    """
+    display = _abrir_x11()
+    if display is not None:
+        try:
+            raiz = _x11.XDefaultRootWindow(ctypes.c_void_p(display))
+            devolve_raiz = ctypes.c_ulong()
+            x = ctypes.c_int(); y = ctypes.c_int()
+            largura = ctypes.c_uint(); altura = ctypes.c_uint()
+            borda = ctypes.c_uint(); profundidade = ctypes.c_uint()
+            ok = _x11.XGetGeometry(
+                ctypes.c_void_p(display), ctypes.c_ulong(raiz),
+                ctypes.byref(devolve_raiz), ctypes.byref(x), ctypes.byref(y),
+                ctypes.byref(largura), ctypes.byref(altura),
+                ctypes.byref(borda), ctypes.byref(profundidade),
+            )
+            if ok and largura.value > 0 and altura.value > 0:
+                return largura.value, altura.value
+        except Exception as e:
+            logger.warning(f"Painel de TV: falha ao medir a tela pelo X ({e}).")
+    return janela.winfo_screenwidth(), janela.winfo_screenheight()
+
+
 # ------------------------------ coluna -----------------------------------
 class ColunaPainel(tk.Frame):
     """Cabeçalho de seção + a lista de cards embaixo."""
@@ -5068,7 +5168,7 @@ class ColunaPainel(tk.Frame):
     def altura_util(self):
         altura = self.lista.winfo_height()
         if altura <= 20:
-            altura = self.winfo_toplevel().winfo_screenheight() - 150
+            altura = tamanho_real_da_tela(self.winfo_toplevel())[1] - 150
         return max(200, altura)
 
     def calcular_altura_card(self):
@@ -5145,7 +5245,7 @@ class PainelTV(tk.Tk):
         FONTES_PAINEL = FontesPainel()
 
         self._em_tela_cheia = False
-        self._tela_conhecida = (self.winfo_screenwidth(), self.winfo_screenheight())
+        self._tela_conhecida = tamanho_real_da_tela(self)
         self._logo_ref = None
         self._job_ajuste = None
         self._job_preaquecer = None
@@ -5275,7 +5375,7 @@ class PainelTV(tk.Tk):
 
     def _aplicar_tela_cheia(self):
         self.update_idletasks()
-        tela = (self.winfo_screenwidth(), self.winfo_screenheight())
+        tela = tamanho_real_da_tela(self)
         self.geometry(f"{tela[0]}x{tela[1]}+0+0")
         try:
             self.attributes("-fullscreen", True)
@@ -5298,8 +5398,11 @@ class PainelTV(tk.Tk):
         redimensionada), o painel ficava com metade do conteúdo fora da tela
         até alguém reiniciar o bot. Vale para qualquer mexida no HDMI, não só
         no boot: tirar e recolocar o cabo cai no mesmo caso.
+
+        A medida vem de tamanho_real_da_tela(), não de winfo_screenwidth():
+        veja lá por que a segunda mente depois de um xrandr.
         """
-        tela = (self.winfo_screenwidth(), self.winfo_screenheight())
+        tela = tamanho_real_da_tela(self)
         if tela != self._tela_conhecida:
             anterior = self._tela_conhecida
             self._tela_conhecida = tela
@@ -5543,7 +5646,7 @@ class PainelTV(tk.Tk):
         """
         largura = self.overlay_conteudo.winfo_width()
         if largura <= 200:   # ainda não dimensionado: cai na tela toda
-            largura = self.winfo_screenwidth() - 2 * 18 - 2 * 64
+            largura = tamanho_real_da_tela(self)[0] - 2 * 18 - 2 * 64
         return max(400, largura)
 
     def _largura_coluna_alerta(self):
@@ -6079,6 +6182,38 @@ def executar_monitoramento(exibir=None):
                                     registrar_capex_notificada()
                                     registrar_entrante_capex(unidade)
                                     logger.info(f"Notificada: OS {os_id} - {codigo} ({nome_cliente})")
+
+                                    # Reincidência de improdutiva técnica: vai
+                                    # DEPOIS do entrante ter sido notificado e
+                                    # carimbado. Assim, se esta consulta falhar
+                                    # ou a base estiver velha, o alerta
+                                    # principal já saiu -- e a OS não volta a
+                                    # ser notificada no próximo ciclo só porque
+                                    # o extra deu errado.
+                                    data_abertura_ms = chamado.get('dataAbertura')
+                                    quando_entrou = datetime.now()
+                                    if data_abertura_ms:
+                                        try:
+                                            quando_entrou = datetime.fromtimestamp(
+                                                data_abertura_ms / 1000
+                                            )
+                                        except Exception:
+                                            pass
+
+                                    achado = verificar_improdutiva_anterior(
+                                        contrato, nome_cliente, quando_entrou
+                                    )
+                                    if achado:
+                                        notificar_improdutiva_telegram(
+                                            cidade, contrato, nome_cliente, bairro,
+                                            telefones_str, achado
+                                        )
+                                        registrar_improdutiva_notificada()
+                                        logger.warning(
+                                            f"IMPRODUTIVA ANTERIOR: OS {os_id} ({nome_cliente}) "
+                                            f"— casou por {achado['casou_por']} com "
+                                            f"'{achado['motivo']}' de {achado['dias']} dia(s) atrás."
+                                        )
 
                                     if TV_ATIVA:
                                         FILA_EVENTOS_TV.put({
