@@ -155,7 +155,7 @@ if (!fs.existsSync(PASTA_ARQUIVOS_RECEBIDOS)) {
 
 // ---------- Configuração ----------
 function carregarConfig() {
-  const padrao = { grupoJid: '', porta: 3939 };
+  const padrao = { grupoJid: '', porta: 3939, gruposRegiao: {} };
   if (!fs.existsSync(CONFIG_PATH)) {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(padrao, null, 2), 'utf-8');
     console.log(`📝 Arquivo config.json criado em ${CONFIG_PATH}. Preencha "grupoJid" antes de usar em produção.`);
@@ -163,7 +163,7 @@ function carregarConfig() {
   }
   try {
     const dados = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
-    return { ...padrao, ...dados };
+    return { ...padrao, ...dados, gruposRegiao: { ...padrao.gruposRegiao, ...(dados.gruposRegiao || {}) } };
   } catch (e) {
     console.log(`⚠️  Falha ao ler config.json (${e.message}). Usando valores padrão.`);
     return padrao;
@@ -171,6 +171,97 @@ function carregarConfig() {
 }
 
 const config = carregarConfig();
+
+// ---------- Os grupos por região (lista de garantias) ----------
+//
+// O serviço nasceu falando com UM grupo só (`grupoJid`), que é onde os alertas
+// e os comandos vivem até hoje -- e continua sendo, intocado. O que entrou em
+// 13/08/2026 foi a lista de garantias de hora em hora, que é REGIONAL: a do
+// litoral não interessa a quem roteia o Rio e vice-versa. Daí um segundo
+// destino possível no envio.
+//
+// Os JIDs não são digitados à mão nem adivinhados pelo nome do grupo.
+//
+// Um JID é um número opaco (`1203...@g.us`); pedir para alguém copiar dois
+// desses de um terminal é o tipo de passo que se erra em silêncio. Casar pelo
+// NOME do grupo parece resolver e não resolve: nome de grupo de WhatsApp tem
+// emoji, acento, travessão e muda sem aviso, e um casamento errado manda a
+// lista do Rio para o grupo do litoral -- pior do que não mandar, porque quem
+// roteia agiria sobre contrato que não é dele.
+//
+// Então o JID é APRENDIDO POR ESCUTA: liga-se uma janela curta, alguém manda
+// qualquer mensagem no grupo, e o serviço anota de qual JID ela veio. A
+// mensagem prova o grupo; o nome não prova nada.
+const ESCUTA_MINUTOS_PADRAO = 15;
+const ESCUTA_MINUTOS_MAX = 120;
+
+let escutaAte = 0;                    // epoch ms; 0 ou passado = desligada
+const gruposVistos = new Map();       // jid -> { jid, nome, quando, quem }
+
+function escutaLigada() {
+  return Date.now() < escutaAte;
+}
+
+// Anota SÓ o que identifica o grupo: JID, nome, quando e quem mandou.
+//
+// O TEXTO da mensagem não entra aqui de propósito. Durante a janela o serviço
+// enxerga todo grupo de que a conta participa, e o objetivo é descobrir um
+// número -- não construir um registro de conversa de grupos que este bot não
+// tem nada que ler.
+async function anotarGrupoVisto(sock, jid, participante) {
+  if (gruposVistos.has(jid)) return;
+
+  let nome = '';
+  try {
+    const meta = await sock.groupMetadata(jid);
+    nome = (meta && meta.subject) || '';
+  } catch (e) {
+    nome = '(não consegui ler o nome do grupo)';
+  }
+
+  gruposVistos.set(jid, {
+    jid,
+    nome,
+    quando: new Date().toISOString(),
+    quem: participante || '',
+  });
+  console.log(`👂 Escuta: mensagem vinda de "${nome}" -> ${jid}`);
+}
+
+function salvarConfig() {
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
+    return true;
+  } catch (e) {
+    console.log('⚠️  Falha ao gravar config.json:', e.message);
+    return false;
+  }
+}
+
+const REGIOES_VALIDAS = ['litoral', 'rj'];
+
+// Resolve o campo "destino" do corpo do POST.
+// Devolve { jid } ou { erro }. NUNCA cai no grupo principal por engano: um
+// destino pedido e não resolvido é erro, não motivo para mandar para outro
+// lugar. Sem `destino`, é o comportamento de sempre (grupo principal).
+function resolverDestino(destino) {
+  if (!destino || destino === 'principal') {
+    return config.grupoJid
+      ? { jid: config.grupoJid }
+      : { erro: 'grupoJid não configurado em config.json (rode --listar-grupos)' };
+  }
+  const pedido = String(destino).trim();
+  if (pedido.endsWith('@g.us')) return { jid: pedido };   // JID cru, para teste
+
+  const jid = config.gruposRegiao[pedido];
+  if (!jid) {
+    return {
+      erro: `destino "${pedido}" sem JID conhecido. Regiões resolvidas: `
+        + `${JSON.stringify(config.gruposRegiao)}. Veja GET /grupos.`,
+    };
+  }
+  return { jid };
+}
 
 let sockGlobal = null;
 let conectado = false;
@@ -259,6 +350,16 @@ async function iniciar() {
       try {
         if (!m.message) continue; // mensagens de sistema (ex: entrou/saiu do grupo) não têm conteúdo
         if (m.key.fromMe) continue; // ignora mensagens enviadas pelo próprio bot
+
+        // Janela de aprendizado de JID. Fica ANTES do filtro do grupo
+        // configurado porque o ponto é justamente ver os OUTROS grupos --
+        // e depois do filtro nada disso chegaria aqui. Só anota metadado,
+        // nunca o texto (ver anotarGrupoVisto).
+        if (escutaLigada() && String(m.key.remoteJid || '').endsWith('@g.us')) {
+          anotarGrupoVisto(sock, m.key.remoteJid, m.key.participant || '')
+            .catch((e) => console.log('⚠️  Falha ao anotar grupo visto:', e.message));
+        }
+
         if (!config.grupoJid || m.key.remoteJid !== config.grupoJid) continue; // só o grupo configurado
 
         const participante = m.key.participant || m.key.remoteJid;
@@ -371,6 +472,14 @@ async function iniciar() {
       } else if (!config.grupoJid) {
         console.log('ℹ️  Nenhum "grupoJid" configurado ainda. Rode: node index.js --listar-grupos');
       }
+
+      const faltando = REGIOES_VALIDAS.filter((r) => !config.gruposRegiao[r]);
+      if (faltando.length) {
+        console.log(
+          `ℹ️  Região sem JID: ${faltando.join(', ')}. `
+          + 'Ligue a escuta (POST /escuta-grupos) e mande uma mensagem no grupo.'
+        );
+      }
     }
 
     if (connection === 'close') {
@@ -426,7 +535,7 @@ const servidor = http.createServer((req, res) => {
     req.on('end', async () => {
       res.setHeader('Content-Type', 'application/json');
       try {
-        const { mensagem } = JSON.parse(corpo || '{}');
+        const { mensagem, destino } = JSON.parse(corpo || '{}');
 
         if (!mensagem || !String(mensagem).trim()) {
           res.writeHead(400);
@@ -436,13 +545,14 @@ const servidor = http.createServer((req, res) => {
           res.writeHead(503);
           return res.end(JSON.stringify({ ok: false, erro: 'WhatsApp ainda não conectado' }));
         }
-        if (!config.grupoJid) {
+        const alvo = resolverDestino(destino);
+        if (alvo.erro) {
           res.writeHead(500);
-          return res.end(JSON.stringify({ ok: false, erro: 'grupoJid não configurado em config.json (rode --listar-grupos)' }));
+          return res.end(JSON.stringify({ ok: false, erro: alvo.erro }));
         }
 
-        await sockGlobal.sendMessage(config.grupoJid, { text: mensagem });
-        console.log(`📤 Alerta enviado ao grupo: "${String(mensagem).slice(0, 80)}${mensagem.length > 80 ? '...' : ''}"`);
+        await sockGlobal.sendMessage(alvo.jid, { text: mensagem });
+        console.log(`📤 Alerta enviado (${destino || 'principal'}): "${String(mensagem).slice(0, 80)}${mensagem.length > 80 ? '...' : ''}"`);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
       } catch (e) {
@@ -469,7 +579,7 @@ const servidor = http.createServer((req, res) => {
       if (corpoGrandeDemais) return;
       res.setHeader('Content-Type', 'application/json');
       try {
-        const { imagemBase64, legenda } = JSON.parse(corpo || '{}');
+        const { imagemBase64, legenda, destino } = JSON.parse(corpo || '{}');
 
         if (!imagemBase64 || !String(imagemBase64).trim()) {
           res.writeHead(400);
@@ -479,9 +589,10 @@ const servidor = http.createServer((req, res) => {
           res.writeHead(503);
           return res.end(JSON.stringify({ ok: false, erro: 'WhatsApp ainda não conectado' }));
         }
-        if (!config.grupoJid) {
+        const alvo = resolverDestino(destino);
+        if (alvo.erro) {
           res.writeHead(500);
-          return res.end(JSON.stringify({ ok: false, erro: 'grupoJid não configurado em config.json (rode --listar-grupos)' }));
+          return res.end(JSON.stringify({ ok: false, erro: alvo.erro }));
         }
 
         let bufferImagem;
@@ -492,11 +603,11 @@ const servidor = http.createServer((req, res) => {
           return res.end(JSON.stringify({ ok: false, erro: 'imagemBase64 inválido (falha ao decodificar)' }));
         }
 
-        await sockGlobal.sendMessage(config.grupoJid, {
+        await sockGlobal.sendMessage(alvo.jid, {
           image: bufferImagem,
           caption: legenda || '',
         });
-        console.log(`🖼️  Imagem enviada ao grupo (${bufferImagem.length} bytes)${legenda ? ` com legenda: "${String(legenda).slice(0, 60)}..."` : ''}`);
+        console.log(`🖼️  Imagem enviada (${destino || 'principal'}, ${bufferImagem.length} bytes)${legenda ? ` com legenda: "${String(legenda).slice(0, 60)}..."` : ''}`);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
       } catch (e) {
@@ -506,7 +617,135 @@ const servidor = http.createServer((req, res) => {
     });
   } else if (req.method === 'GET' && req.url === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ conectado, grupoJid: config.grupoJid || null }));
+    res.end(JSON.stringify({
+      conectado,
+      grupoJid: config.grupoJid || null,
+      gruposRegiao: config.gruposRegiao || {},
+    }));
+  } else if (req.url === '/escuta-grupos' && (req.method === 'POST' || req.method === 'GET')) {
+    // Aprender o JID de um grupo pela escuta.
+    //
+    //   POST /escuta-grupos  {"minutos": 15}   -> liga a janela ({"minutos":0} desliga)
+    //   GET  /escuta-grupos                    -> o que foi visto até agora
+    //
+    // A janela EXPIRA sozinha. Enquanto ligada o serviço enxerga todo grupo de
+    // que a conta participa, e isso não é estado para ficar ligado por
+    // esquecimento -- por isso tem prazo, teto e some sem ninguém desligar.
+    let corpo = '';
+    req.on('data', (chunk) => (corpo += chunk));
+    req.on('end', () => {
+      res.setHeader('Content-Type', 'application/json');
+      try {
+        if (req.method === 'POST') {
+          const { minutos } = JSON.parse(corpo || '{}');
+          const pedido = minutos === undefined ? ESCUTA_MINUTOS_PADRAO : Number(minutos);
+          if (!Number.isFinite(pedido) || pedido < 0 || pedido > ESCUTA_MINUTOS_MAX) {
+            res.writeHead(400);
+            return res.end(JSON.stringify({
+              ok: false,
+              erro: `"minutos" tem de estar entre 0 e ${ESCUTA_MINUTOS_MAX}`,
+            }));
+          }
+          if (pedido === 0) {
+            escutaAte = 0;
+            console.log('👂 Escuta de grupos DESLIGADA a pedido.');
+          } else {
+            escutaAte = Date.now() + pedido * 60 * 1000;
+            gruposVistos.clear();   // cada janela começa limpa
+            console.log(`👂 Escuta de grupos LIGADA por ${pedido} min.`);
+          }
+        }
+
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          ok: true,
+          ligada: escutaLigada(),
+          expiraEm: escutaLigada() ? new Date(escutaAte).toISOString() : null,
+          segundosRestantes: escutaLigada()
+            ? Math.round((escutaAte - Date.now()) / 1000) : 0,
+          gruposRegiao: config.gruposRegiao || {},
+          vistos: Array.from(gruposVistos.values()),
+        }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ ok: false, erro: e.message }));
+      }
+    });
+  } else if (req.method === 'POST' && req.url === '/escuta-grupos/atribuir') {
+    // Grava o JID aprendido na região. Passo SEPARADO da escuta de propósito:
+    // ver de qual grupo veio a mensagem é observação, decidir que aquele grupo
+    // é "o do Rio" é decisão -- e quem decide é quem mandou a mensagem.
+    let corpo = '';
+    req.on('data', (chunk) => (corpo += chunk));
+    req.on('end', () => {
+      res.setHeader('Content-Type', 'application/json');
+      try {
+        const { regiao, jid } = JSON.parse(corpo || '{}');
+        if (!REGIOES_VALIDAS.includes(regiao)) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({
+            ok: false, erro: `"regiao" tem de ser uma de: ${REGIOES_VALIDAS.join(', ')}`,
+          }));
+        }
+        if (!jid || !String(jid).endsWith('@g.us')) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ ok: false, erro: '"jid" tem de terminar em @g.us' }));
+        }
+
+        // Uma região por grupo e um grupo por região: o mesmo JID nas duas
+        // faria o litoral receber a lista do Rio por cima da dele, e a segunda
+        // mensagem apagaria a primeira da tela sem ninguém notar.
+        const jaUsado = Object.entries(config.gruposRegiao)
+          .find(([r, j]) => j === jid && r !== regiao);
+        if (jaUsado) {
+          res.writeHead(409);
+          return res.end(JSON.stringify({
+            ok: false, erro: `esse JID já está atribuído à região "${jaUsado[0]}"`,
+          }));
+        }
+
+        config.gruposRegiao[regiao] = String(jid);
+        if (!salvarConfig()) {
+          res.writeHead(500);
+          return res.end(JSON.stringify({ ok: false, erro: 'falha ao gravar config.json' }));
+        }
+        const visto = gruposVistos.get(String(jid));
+        console.log(`💾 Região "${regiao}" -> ${visto ? `"${visto.nome}" ` : ''}${jid}`);
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, gruposRegiao: config.gruposRegiao }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ ok: false, erro: e.message }));
+      }
+    });
+  } else if (req.method === 'GET' && req.url === '/grupos') {
+    // Diagnóstico da descoberta automática: mostra o nome de TODOS os grupos
+    // com seus JIDs e o que ficou resolvido por região. É o que se olha
+    // quando a lista de garantias não chega em algum dos dois grupos.
+    res.setHeader('Content-Type', 'application/json');
+    if (!conectado || !sockGlobal) {
+      res.writeHead(503);
+      return res.end(JSON.stringify({ ok: false, erro: 'WhatsApp ainda não conectado' }));
+    }
+    sockGlobal.groupFetchAllParticipating()
+      .then((grupos) => {
+        const lista = Object.entries(grupos).map(([jid, info]) => ({
+          jid,
+          nome: (info && info.subject) || '',
+        }));
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          ok: true,
+          principal: config.grupoJid || null,
+          gruposRegiao: config.gruposRegiao || {},
+          grupos: lista,
+        }));
+      })
+      .catch((e) => {
+        res.writeHead(500);
+        res.end(JSON.stringify({ ok: false, erro: e.message }));
+      });
   } else if (req.method === 'GET' && req.url === '/mensagens') {
     res.setHeader('Content-Type', 'application/json');
 
@@ -552,9 +791,12 @@ const servidor = http.createServer((req, res) => {
 
 servidor.listen(config.porta, '127.0.0.1', () => {
   console.log(`🌐 Serviço de alertas do grupo escutando em http://127.0.0.1:${config.porta}`);
-  console.log(`   POST /alerta     { "mensagem": "texto" }`);
+  console.log(`   POST /alerta     { "mensagem": "texto", "destino": "principal|litoral|rj" }`);
   console.log(`   GET  /status`);
   console.log(`   GET  /mensagens  (fila de mensagens recebidas do grupo, consumo único)`);
+  console.log(`   GET  /grupos     (todos os grupos e seus JIDs)`);
+  console.log(`   POST /escuta-grupos           { "minutos": 15 }  liga a escuta de JID`);
+  console.log(`   POST /escuta-grupos/atribuir  { "regiao": "rj", "jid": "...@g.us" }`);
 });
 
 iniciar().catch((e) => console.error('Erro fatal ao iniciar o serviço de alertas:', e));
