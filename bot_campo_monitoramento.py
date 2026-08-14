@@ -59,6 +59,8 @@ from amostra_chamados import salvar_amostra_chamados, salvar_diagnostico_plano
 
 # ============ MODIFICADO: importar também a nova função ============
 from backlog_envio import gerar_e_enviar_backlog, gerar_e_enviar_backlog_tipo, configurar_telegram
+import garantias_envio
+import garantias_lista
 import improdutivas
 
 try:
@@ -205,12 +207,22 @@ TIMEOUT_AGUARDANDO_CONTRATO_AUTENTICADOR_SEG = 5 * 60
 # "espera" independente, em vez de compartilhar o estado do chat inteiro).
 AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP = {}
 
-# O /improdutivas foi aposentado em 13/08/2026. Era um relatório de lote:
-# alguém mandava o comando, anexava o CSV do OFS no grupo e recebia listas por
-# região. Não tinha memória e não cruzava com nada -- analisava e esquecia.
-# No lugar dele, a mesma classificação de motivos passou a rodar sozinha, a
-# cada entrante, contra a base de 30 dias (ver improdutivas.py e
-# verificar_improdutiva_anterior).
+# O /improdutivas mudou de natureza duas vezes em 13/08/2026, e é bom saber
+# qual dos três ele é hoje:
+#
+# 1. ERA um relatório de lote: alguém mandava o comando, ANEXAVA o CSV do OFS
+#    no grupo e recebia listas por região. Não tinha memória e não cruzava com
+#    nada -- analisava, imprimia e esquecia.
+# 2. Foi APOSENTADO, e no lugar dele a mesma classificação de motivos passou a
+#    rodar sozinha a cada entrante, contra a base de 30 dias (improdutivas.py e
+#    verificar_improdutiva_anterior). Isso continua valendo: é o alerta.
+# 3. VOLTOU, com outro corpo, quando ficou claro que alerta não é lista. O
+#    alerta é evento -- conta que algo aconteceu e some na conversa do grupo.
+#    A pergunta de quem monta roteiro é outra: o que está de pé AGORA. Hoje o
+#    comando varre os CAPEX abertos no CAMPO e devolve, por região, os que têm
+#    improdutiva recente (montar_lista_improdutivas_abertas).
+#
+# O comando NÃO espera mais anexo: as bases entram pelo site.
 
 # Guarda a última lista de chamados buscada da API do CAMPO (atualizada a cada
 # ciclo do loop de monitoramento). O agendador horário do backlog de CAPEX e
@@ -232,8 +244,16 @@ LISTA_CHAMADOS_ATUAL = {"dados": None}
 # Quem processa o chamado CRU continua recebendo o chamado cru: a projeção só
 # vale para o que sobrevive à varredura. `extrair_telefones_do_chamado`, por
 # exemplo, precisa da estrutura aninhada inteira para achar os contatos.
+# nomeCliente e enderecoBairro entraram em 13/08/2026 para o /improdutivas
+# consolidado. Não é comodidade: a regra de reincidência casa por contrato OU
+# por NOME, e é assim que o alerta individual decide. Uma lista que só casasse
+# por contrato apontaria menos casos do que os avisos já enviados no grupo, e
+# ninguém saberia dizer qual das duas estava errada. São duas strings curtas
+# por chamado -- a projeção existe para descartar `ordemServicos`, que é a
+# parte pesada, não para economizar bytes de texto.
 CAMPOS_CACHE_BACKLOG = ("id", "fila", "enderecoUnidade", "codigoContrato",
-                        "dataAbertura", "dataConclusao", "agendamentoData")
+                        "dataAbertura", "dataConclusao", "agendamentoData",
+                        "nomeCliente", "enderecoBairro")
 
 
 def projetar_para_cache(lista_chamados):
@@ -2449,6 +2469,191 @@ def acompanhar_remarcacao(chamado, os_id, unidade, agendamentos_vistos):
 # OFS varre TODOS os pendentes, sem esta trava uma planilha nova dispara
 # garantia de O.S. fechada dias atrás, indistinguível de uma legítima.
 #
+# ============ /improdutivas: a lista consolidada (13/08/2026) ============
+# Os avisos de reincidência são EVENTOS: contam que algo aconteceu (entrou uma
+# O.S., remarcaram uma O.S.) e somem no meio da conversa do grupo. Ninguém
+# consegue rolar três dias de mensagens para montar roteiro.
+#
+# Esta lista responde outra pergunta: o que ESTÁ DE PÉ agora. Por isso ela não
+# se monta a partir dos avisos já enviados -- lá dentro há O.S. que já foram
+# resolvidas -- e sim varrendo os CAPEX abertos no CAMPO neste momento e
+# perguntando de cada um, com a MESMA regra do aviso, se há improdutiva
+# recente. Uma O.S. que fechou some da lista sozinha, sem ninguém dar baixa.
+def montar_lista_improdutivas_abertas(lista_chamados):
+    """{'litoral': [...], 'rj': [...], 'total': n, 'analisados': n}.
+
+    Nunca levanta: é resposta a comando no grupo, e falhar aqui tem de virar
+    um recado, não um traceback que só aparece no log.
+    """
+    por_regiao = {'litoral': [], 'rj': []}
+    de_qual_regiao = {}
+    for sigla in LITORAL_SP:
+        de_qual_regiao[sigla] = 'litoral'
+    for sigla in RJ:
+        de_qual_regiao[sigla] = 'rj'
+
+    analisados = 0
+    for chamado in (lista_chamados or ()):
+        if not isinstance(chamado, dict):
+            continue
+
+        fila = chamado.get('fila')
+        if isinstance(fila, dict):
+            codigo = fila.get('codigo')
+        elif isinstance(fila, str):
+            codigo = fila
+        else:
+            codigo = chamado.get('codigo')
+        if codigo not in CODIGOS_ALVO:
+            continue
+
+        unidade = str(chamado.get('enderecoUnidade', '')).upper().strip()
+        regiao = de_qual_regiao.get(unidade)
+        if not regiao:
+            continue
+
+        analisados += 1
+        contrato = chamado.get('codigoContrato', 'N/D')
+        nome_cliente = chamado.get('nomeCliente') or 'N/D'
+        if isinstance(nome_cliente, str):
+            nome_cliente = nome_cliente.strip() or 'N/D'
+
+        # A janela de 30 dias conta a partir do agendamento quando existe --
+        # mesma escolha do aviso de remarcação: o que importa é se houve
+        # improdutiva perto da visita que vão fazer, não perto da abertura.
+        agendamento = chamado.get('agendamentoData')
+        quando = _data_agendamento(agendamento)
+        if quando is None:
+            data_ms = chamado.get('dataAbertura')
+            if data_ms:
+                try:
+                    quando = datetime.fromtimestamp(float(data_ms) / 1000)
+                except Exception:
+                    quando = None
+        if quando is None:
+            quando = datetime.now()
+
+        try:
+            achado = verificar_improdutiva_anterior(contrato, nome_cliente, quando)
+        except Exception:
+            logger.exception("Falha ao consultar improdutiva da OS %s.", chamado.get('id'))
+            continue
+        if not achado:
+            continue
+
+        data_agenda = _data_agendamento(agendamento)
+        por_regiao[regiao].append({
+            'os_id': chamado.get('id'),
+            'unidade': unidade,
+            'contrato': str(contrato),
+            'cliente': str(nome_cliente),
+            'bairro': str(chamado.get('enderecoBairro') or 'N/D'),
+            'agendamento': data_agenda.strftime('%d/%m') if data_agenda else None,
+            'ordem_agenda': data_agenda or datetime.max,
+            'motivo': str(achado.get('motivo') or 'N/D'),
+            'dias': achado.get('dias'),
+            'casou_por': achado.get('casou_por'),
+            'quantas': achado.get('quantas', 1),
+        })
+
+    for itens in por_regiao.values():
+        # Quem tem visita marcada mais cedo primeiro; sem data vai para o fim,
+        # que é a ordem em que a operação precisa agir.
+        itens.sort(key=lambda i: (i['ordem_agenda'], i['unidade'], i['contrato']))
+
+    return {
+        'litoral': por_regiao['litoral'],
+        'rj': por_regiao['rj'],
+        'total': len(por_regiao['litoral']) + len(por_regiao['rj']),
+        'analisados': analisados,
+        'gerado_em': datetime.now().strftime('%d/%m/%Y %H:%M'),
+    }
+
+
+def _bloco_improdutivas(titulo, itens, negrito):
+    if not itens:
+        return [f"{negrito}{titulo}{negrito}", "_nenhuma no momento_", ""]
+
+    linhas = [f"{negrito}{titulo} ({len(itens)}){negrito}", ""]
+    for item in itens:
+        cabeca = f"• {item['contrato']} — {item['unidade']}"
+        if item['agendamento']:
+            cabeca += f" — agenda {item['agendamento']}"
+        linhas.append(cabeca)
+        linhas.append(f"   {item['cliente']} · {item['bairro']}")
+
+        dias = item['dias']
+        if dias == 0:
+            quando_txt = "hoje"
+        elif dias == 1:
+            quando_txt = "ontem"
+        else:
+            quando_txt = f"há {dias} dias"
+        detalhe = f"   improdutiva: {item['motivo']} ({quando_txt})"
+        if item['quantas'] > 1:
+            detalhe += f" · {item['quantas']} na janela"
+        if item['casou_por'] != 'contrato':
+            # Mesma ressalva do aviso: nome é chave fraca e quem lê tem de
+            # saber disso ANTES de mandar técnico.
+            detalhe += " · casou por NOME (confira)"
+        linhas.append(detalhe)
+        linhas.append("")
+    return linhas
+
+
+def montar_mensagem_improdutivas(dados, whatsapp=False):
+    """O texto do /improdutivas. `whatsapp` troca o negrito de HTML para *."""
+    negrito = "*" if whatsapp else ""
+
+    if dados['total'] == 0:
+        corpo = (
+            f"Nenhum CAPEX em aberto com improdutiva recente "
+            f"({dados['analisados']} analisado(s))."
+        )
+        return (f"{negrito}IMPRODUTIVAS REINCIDENTES EM ABERTO{negrito}\n"
+                f"_{dados['gerado_em']}_\n\n{corpo}")
+
+    linhas = [
+        f"{negrito}IMPRODUTIVAS REINCIDENTES EM ABERTO{negrito}",
+        f"_{dados['total']} de {dados['analisados']} CAPEX abertos · {dados['gerado_em']}_",
+        "",
+    ]
+    linhas += _bloco_improdutivas("SUL RJ", dados['rj'], negrito)
+    linhas += _bloco_improdutivas("LITORAL NORTE SP", dados['litoral'], negrito)
+    return "\n".join(linhas).strip()
+
+
+def responder_improdutivas(whatsapp=False):
+    """Monta e envia a lista consolidada no grupo onde os comandos vivem."""
+    enviar = enviar_alerta_whatsapp_grupo if whatsapp else enviar_alerta_telegram
+    try:
+        dados = montar_lista_improdutivas_abertas(obter_lista_chamados_atual())
+    except Exception:
+        logger.exception("Falha ao montar a lista consolidada de improdutivas.")
+        enviar("⚠️ Não consegui montar a lista de improdutivas. Veja o log.")
+        return
+
+    texto = montar_mensagem_improdutivas(dados, whatsapp=whatsapp)
+
+    # A mensagem cresce com a operação; quebrar por bloco evita esbarrar no
+    # limite do Telegram (4096) sem cortar um item ao meio.
+    limite = 3500
+    if len(texto) <= limite:
+        enviar(texto)
+        return
+    atual = []
+    tamanho = 0
+    for linha in texto.split("\n"):
+        if tamanho + len(linha) + 1 > limite and atual:
+            enviar("\n".join(atual))
+            time.sleep(1.0)
+            atual, tamanho = [], 0
+        atual.append(linha)
+        tamanho += len(linha) + 1
+    if atual:
+        enviar("\n".join(atual))
+
+
 # A trava é o conjunto de O.S. de reparo vistas ABERTAS na última varredura
 # completa. Fica só em memória de propósito: é barato, sempre fresco (a
 # varredura roda a cada volta) e não acrescenta escrita a um arquivo que já
@@ -2474,6 +2679,112 @@ def reparos_abertos_conhecidos():
     """(conjunto, carimbo). carimbo=None => nenhuma varredura completa ainda."""
     with _TRAVA_REPAROS_ABERTOS:
         return set(_REPAROS_ABERTOS["os"]), _REPAROS_ABERTOS["carimbo"]
+
+
+# ============ LISTA DE GARANTIAS PARA OS GRUPOS REGIONAIS (13/08/2026) ============
+# A lista de hora em hora nasce do cruzamento de duas coisas que já existiam:
+# as garantias notificadas (reparos_avaliados.json) e as O.S. de reparo que a
+# última varredura viu abertas no CAMPO (logo acima). Ver garantias_lista.py.
+def preencher_tecnico_ofs_faltante(reparos_avaliados):
+    """Grava o técnico OFS nas garantias notificadas que não o têm.
+
+    O técnico é fato FIXO do serviço original: quem executou o reparo/ativação
+    que gerou a garantia já executou, e isso não muda mais. Então ele é
+    procurado UMA vez e gravado -- nunca recalculado na hora de montar a lista.
+
+    Recalcular seria pior do que inútil. `verificar_garantia_reparo` devolve o
+    PRIMEIRO serviço do contrato que cai na janela, e a Base OFS é substituída
+    pelo site a cada envio. Com outra base, outro serviço do mesmo contrato
+    pode casar primeiro -- e a linha sairia com o `dias_aging` gravado de um
+    serviço e o técnico de outro. Duas verdades na mesma linha, sem nada
+    denunciando.
+
+    Daí a conferência abaixo: o técnico só é aceito quando o serviço
+    reencontrado é comprovadamente o MESMO que gerou a garantia (mesmo tipo e
+    mesmo aging). Não batendo, fica sem técnico -- `N/D` é honesto, técnico
+    errado não.
+
+    Só serve às garantias notificadas antes de 13/08/2026, quando o campo
+    ainda não era gravado. Devolve quantos registros mudaram.
+    """
+    preenchidos = 0
+    for chave, info in (reparos_avaliados or {}).items():
+        if not isinstance(info, dict) or not info.get('notificado'):
+            continue
+        if info.get('tecnico_ofs'):
+            continue
+
+        contrato = info.get('codigo_contrato')
+        if not contrato or contrato == 'N/D':
+            continue
+
+        quando = None
+        if info.get('data_abertura'):
+            try:
+                quando = datetime.fromisoformat(str(info['data_abertura']))
+            except Exception:
+                quando = None
+        if quando is None:
+            # Sem a data de abertura não dá para reencontrar o serviço com
+            # segurança -- e chutar datetime.now() casaria qualquer coisa.
+            continue
+
+        try:
+            eh_garantia, tipo, aging, tecnico = verificar_garantia_reparo(contrato, quando)
+        except Exception:
+            logger.debug("Falha ao reencontrar o técnico OFS do contrato %s.",
+                         contrato, exc_info=True)
+            continue
+
+        if not (eh_garantia and tecnico):
+            continue
+        if info.get('dias_aging') is not None and aging != info.get('dias_aging'):
+            continue
+        if info.get('tipo_anterior') and str(tipo) != str(info.get('tipo_anterior')):
+            continue
+
+        info['tecnico_ofs'] = tecnico
+        preenchidos += 1
+
+    if preenchidos:
+        logger.info(
+            "Técnico OFS preenchido em %d garantia(s) antiga(s) e gravado em disco.",
+            preenchidos
+        )
+    return preenchidos
+
+
+def estado_para_lista_garantias():
+    """(reparos_avaliados, O.S. abertas, carimbo) para montar a lista.
+
+    Lê o JSON do disco em vez de compartilhar o dict do laço de varredura.
+    Pode: toda garantia é gravada NA HORA em que é notificada (ver o comentário
+    do salvar_reparos_avaliados no laço), então o arquivo já contém tudo o que
+    a lista precisa. E assim nenhuma outra thread encosta no dict que a
+    varredura está usando.
+    """
+    abertas, carimbo = reparos_abertos_conhecidos()
+    reparos = carregar_reparos_avaliados()
+
+    # Preenche o que falta e GRAVA. Roda aqui, e não no arranque, porque
+    # depende da Base OFS já estar carregada; e é barato repetir, já que a
+    # primeira passagem resolve tudo o que era resolvível e as seguintes só
+    # percorrem um dicionário sem consultar nada.
+    if preencher_tecnico_ofs_faltante(reparos):
+        salvar_reparos_avaliados(reparos)
+
+    return reparos, abertas, carimbo
+
+
+def gerar_e_enviar_garantias_agora(regioes=None):
+    """Monta e manda a lista para os grupos regionais. Usado pelo agendador e
+    pelo comando /garantias."""
+    reparos, abertas, carimbo = estado_para_lista_garantias()
+    return garantias_envio.gerar_e_enviar(
+        reparos, abertas,
+        carimbo_varredura=carimbo,
+        regioes=regioes,
+    )
 
 
 def podar_reparos_antigos(reparos_avaliados):
@@ -2593,6 +2904,11 @@ def reavaliar_reparos_pendentes(reparos_avaliados):
                 info['notificado'] = True
                 info['tipo_anterior'] = tipo_anterior
                 info['dias_aging'] = dias_aging
+                # Guardado desde 13/08/2026 para a lista de garantias que vai
+                # aos grupos de hora em hora. Antes ele era usado na mensagem e
+                # jogado fora -- e reencontrá-lo depois exige a Base OFS do dia
+                # em que a garantia nasceu, que já não é a que está em disco.
+                info['tecnico_ofs'] = tecnico_ofs
                 salvar_reparos_avaliados(reparos_avaliados)
                 logger.info(
                     f"Notificada (GARANTIA - reavaliação): OS {os_id} - Reparo, serviço anterior "
@@ -3857,6 +4173,8 @@ def montar_mensagem_comandos(whatsapp=False):
         f"📊 *{barra}backlog* — gera o backlog de todos os tipos",
         f"     _{barra}backlog {tipos}_ para um tipo só",
         f"🌡️ *{barra}termometro* — termômetro de entrantes CAPEX",
+        "🛠️ *​/improdutivas* — reincidentes de improdutiva em aberto, por região",
+        f"📄 *{barra}garantias* — manda a lista de garantias aos grupos regionais",
         "📡 *​/autenticador* — consulta status de um contrato",
         "🖥️ *​/painel* — endereço do site do painel",
         "🔄 *​/reiniciar* — reinicia a máquina inteira (VPN, bot, site, painel)",
@@ -4201,6 +4519,28 @@ def escutar_comandos_telegram():
                     ).start()
                     continue
 
+                # ============ NOVO (13/08/2026): reincidentes em aberto ============
+                if comando == "/improdutivas":
+                    logger.info("Comando /improdutivas recebido. Montando a lista consolidada...")
+                    enviar_alerta_telegram("⏳ Levantando as improdutivas reincidentes em aberto...")
+                    threading.Thread(
+                        target=responder_improdutivas,
+                        kwargs={'whatsapp': False},
+                        daemon=True,
+                    ).start()
+                    continue
+
+                # ============ NOVO (13/08/2026): a lista de garantias, fora de hora ============
+                if comando == "/garantias":
+                    enviar_alerta_telegram(
+                        "⏳ Gerando a lista de garantias e mandando para os grupos regionais..."
+                    )
+                    threading.Thread(
+                        target=gerar_e_enviar_garantias_agora,
+                        daemon=True,
+                    ).start()
+                    continue
+
                 if texto_bruto and not texto_bruto.startswith("/"):
                     ts_prompt = AGUARDANDO_CONTRATO_AUTENTICADOR.get(chat_id_str)
                     if ts_prompt is not None:
@@ -4255,11 +4595,12 @@ def escutar_comandos_whatsapp():
                 if not remetente or (not texto_bruto and not arquivo):
                     continue
 
-                # Anexo no grupo não é mais assunto do bot: o único comando que
-                # esperava arquivo era o /improdutivas, aposentado em
-                # 13/08/2026. As bases agora entram pelo site. Segue ignorando
-                # explicitamente para não cair no parser de comando de texto
-                # (mensagem com anexo chega com texto="" do lado do Node).
+                # Anexo no grupo não é mais assunto do bot. O único comando que
+                # esperava arquivo era o /improdutivas antigo, de lote; o
+                # /improdutivas de hoje lê o CAMPO e não quer anexo nenhum. As
+                # bases entram pelo site. Segue ignorando explicitamente para
+                # não cair no parser de comando de texto (mensagem com anexo
+                # chega com texto="" do lado do Node).
                 if arquivo:
                     continue
 
@@ -4398,6 +4739,31 @@ def escutar_comandos_whatsapp():
                     enviar_alerta_whatsapp_grupo("⏳ Gerando termômetro de entrantes CAPEX, aguarde...")
                     threading.Thread(
                         target=gerar_e_enviar_termometro_capex,
+                        daemon=True,
+                    ).start()
+                    continue
+
+                # ============ NOVO (13/08/2026): reincidentes em aberto ============
+                # Aceita com e sem barra: no WhatsApp os outros comandos são
+                # escritos sem ela, mas "/improdutivas" é como este comando
+                # sempre foi chamado e é o que a operação vai digitar.
+                if comando in ("improdutivas", "/improdutivas"):
+                    logger.info("Comando /improdutivas recebido no grupo do WhatsApp.")
+                    enviar_alerta_whatsapp_grupo("⏳ Levantando as improdutivas reincidentes em aberto...")
+                    threading.Thread(
+                        target=responder_improdutivas,
+                        kwargs={'whatsapp': True},
+                        daemon=True,
+                    ).start()
+                    continue
+
+                # ============ NOVO (13/08/2026): a lista de garantias, fora de hora ============
+                if comando in ("garantias", "/garantias"):
+                    enviar_alerta_whatsapp_grupo(
+                        "⏳ Gerando a lista de garantias e mandando para os grupos regionais..."
+                    )
+                    threading.Thread(
+                        target=gerar_e_enviar_garantias_agora,
                         daemon=True,
                     ).start()
                     continue
@@ -6466,6 +6832,10 @@ def executar_monitoramento(exibir=None):
                                         dados_reparo['notificado'] = True
                                         dados_reparo['tipo_anterior'] = tipo_anterior
                                         dados_reparo['dias_aging'] = dias_aging
+                                        # Ver a nota em reavaliar_reparos_pendentes:
+                                        # o técnico é gravado para a lista de
+                                        # garantias dos grupos.
+                                        dados_reparo['tecnico_ofs'] = tecnico_ofs
                                         reparos_avaliados[chave_reparo] = dados_reparo
                                         # Grava NA HORA, sem esperar o lote. Esta é
                                         # a única escrita que não pode ser adiada:
@@ -7237,6 +7607,17 @@ def main():
             daemon=True
         )
         thread_termometro.start()
+
+        # ============ NOVO (13/08/2026): lista de garantias nos grupos
+        # regionais, na hora cheia das 7h às 19h. Sobe aqui, antes do
+        # iniciar_servico_alerta_whatsapp abaixo, sem problema: a thread não
+        # envia nada até bater a primeira hora cheia, e a essa altura o
+        # serviço do WhatsApp já está de pé. ============
+        threading.Thread(
+            target=garantias_envio.thread_agendador_garantias,
+            args=(estado_para_lista_garantias,),
+            daemon=True,
+        ).start()
 
         iniciar_vpn_sempre_ativa()
 

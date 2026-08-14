@@ -1,7 +1,11 @@
 # Alerta de reincidência: entrante que já foi improdutiva
 
-> Criado em **13/08/2026**, quando o `/improdutivas` foi aposentado e a mesma
-> classificação passou a rodar sozinha a cada entrante.
+> Criado em **13/08/2026**, quando o `/improdutivas` de lote foi aposentado e
+> a mesma classificação passou a rodar sozinha a cada entrante.
+>
+> No mesmo dia entraram mais duas coisas: o aviso de **remarcação** (seção 1)
+> e a **lista consolidada** que devolveu o `/improdutivas` com outro corpo
+> (seção 7). As três respondem perguntas diferentes com a mesma régua.
 
 ---
 
@@ -239,20 +243,64 @@ Na ordem:
 
 ---
 
-## 7. O que foi aposentado
+## 7. O comando `/improdutivas`
 
-O comando **`/improdutivas`** não existe mais. Era um relatório de lote:
-alguém mandava o comando no grupo do WhatsApp, anexava o CSV do OFS e
-recebia listas por região. Não tinha memória e não cruzava com nada —
-analisava, imprimia e esquecia.
+O comando existe, mas **não é mais o de antes** — e a diferença importa.
 
-Saíram com ele: a espera por anexo no grupo, a formatação por região e a
-quebra de mensagem longa. O bot passou a ignorar anexos no grupo; as bases
-entram pelo site.
+| | Antigo (até 13/08/2026) | Hoje |
+|---|---|---|
+| Entrada | CSV do OFS **anexado no grupo** | nada; lê o CAMPO ao vivo |
+| Responde | tudo que havia no arquivo | só o que está **aberto agora** |
+| Memória | nenhuma | nenhuma, e não precisa |
+
+O antigo era um relatório de lote: analisava, imprimia e esquecia. Saíram
+com ele a espera por anexo e o processamento de arquivo — o bot ignora
+anexos no grupo, as bases entram pelo site.
+
+### Por que ele voltou
+
+Porque **alerta não é lista**. O alerta das seções acima é um *evento*:
+conta que algo aconteceu (entrou uma O.S., remarcaram uma O.S.) e some no
+meio da conversa do grupo. Quem monta roteiro faz outra pergunta — *o que
+está de pé agora* — e a única forma de responder pelo histórico de avisos
+seria rolar três dias de mensagens somando e descontando o que já fechou.
+
+Então o comando varre os **CAPEX abertos no CAMPO neste momento** e pergunta
+de cada um, com a mesma regra da seção 2, se há improdutiva na janela.
+Uma O.S. que fechou some da lista sozinha, sem ninguém dar baixa.
+
+A resposta vem separada em **SUL RJ** e **LITORAL NORTE SP**, ordenada
+pela data de agendamento (quem tem visita mais cedo primeiro; sem data vai
+para o fim):
+
+```
+IMPRODUTIVAS REINCIDENTES EM ABERTO
+3 de 47 CAPEX abertos · 13/08/2026 22:21
+
+SUL RJ (1)
+
+• 700123 — RSD — agenda 15/08
+   BELTRANO · CENTRO
+   improdutiva: Entrada não autorizada (ontem) · casou por NOME (confira)
+
+LITORAL NORTE SP (2)
+
+• 908088 — CGT — agenda 19/08
+   FULANO · MASSAGUACU
+   improdutiva: Problema de infraestrutura (há 5 dias) · 2 na janela
+```
+
+O "3 de 47" é de propósito: sem o denominador, uma lista curta é ambígua
+— não dá para saber se há pouca reincidência ou se a varredura trouxe
+pouca coisa.
+
+Funciona no Telegram (`/improdutivas`) e no grupo do WhatsApp (com ou sem
+a barra). Responde **sempre no grupo principal**, com as duas regiões, que
+é onde os comandos vivem.
 
 **Sobreviveram os dois dicionários de classificação**, que são a mesma
 tabela da visão "Efetividade Geral" do `operacional.py` — e são eles que
-respondem a única pergunta que interessa agora.
+respondem tanto o alerta quanto esta lista.
 
 ---
 
@@ -265,5 +313,6 @@ respondem a única pergunta que interessa agora.
 | Gancho no entrante | mesmo arquivo, no bloco `if codigo in CODIGOS_ALVO` |
 | Gancho na remarcação | mesmo bloco, `acompanhar_remarcacao` — **fora** do `if os_id not in os_notificadas`, que é o ponto todo |
 | Memória do agendamento | `<bot>/dados/agendamentos_vistos.json` |
+| Lista consolidada (`/improdutivas`) | mesmo arquivo, `montar_lista_improdutivas_abertas` e `montar_mensagem_improdutivas` |
 | Registro da planilha | `site/web/fontes/planilhas.py` (`ARQUIVOS`, `ESPELHADOS_NO_BOT`) |
 | Aviso de base faltando | `site/web/config.py` (`problemas()`) |
