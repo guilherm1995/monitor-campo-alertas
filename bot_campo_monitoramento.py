@@ -193,6 +193,22 @@ RJ = [
     'PNHE'
 ]
 
+# Siglas onde executamos serviço mas que NÃO são nossa área de atendimento.
+# Entram só na busca de REPARO (ES05), nunca no alerta de CAPEX: o que se quer
+# ali é não perder uma garantia de serviço nosso executado fora da área.
+#
+# ESTA LISTA É DO VOCABULÁRIO DO CAMPO, NÃO DO DA BASE OFS. Os dois divergem, e
+# a divergência é silenciosa. Em 14/08/2026 a base trazia 84 linhas com sigla
+# `PBS` (cidade Paraíba do Sul) e o CAMPO NUNCA devolveu esse código -- 0 em
+# 7.361 registros; o único daqueles contratos que teve reparo apareceu sob
+# `PDS`, que já está em RJ. Pôr `PBS` aqui seria um filtro que nunca casa:
+# busca vazia, sem erro nenhum, e a garantia real não notificada.
+#
+# ANTES DE ACRESCENTAR UMA SIGLA AQUI: confirme que o CAMPO realmente a emite
+# (conte `unidade` em dados/reparos_avaliados.json). Que ela apareça na Chave
+# Workzone da Base OFS não prova nada -- é o outro dialeto.
+SIGLAS_GARANTIA_EXTRA = ['UTB', 'CBF']
+
 # ================= AUTENTICADOR (consulta de sessões) =================
 AUTENTICADOR_URL_SAVE = "https://provedor.example/status.php?action=save"
 AUTENTICADOR_URL_PROCESSA = "https://provedor.example/processa.php?bg=1"
@@ -435,7 +451,48 @@ TAMANHO_PAGINA_BUSCA_DIRETA = 290
 # alocação por varredura (reaproveitar as estruturas em vez de recriá-las) ou
 # trocar o alocador. Antes disso, confirme na telemetria que a curva não
 # estabiliza sozinha -- arena reaproveitada tende a platô.
-INTERVALO_VARREDURA_COMPLETA_SEG = 120
+#
+# --- 14/08/2026: 120 -> 45, a operação sentiu o atraso ---
+#
+# ESTE NÚMERO É QUANTIZADO, e é a coisa mais importante a saber antes de mexer
+# nele. O laço testa o intervalo UMA VEZ POR VOLTA, e a volta leva ~24 a 29s
+# (varia com o trabalho do ciclo). O efetivo é sempre arredondado PARA CIMA até
+# o próximo tick:
+#
+#   ticks:  ~24,5   ~49   ~73,5   ~98   ~122,5
+#   120  -> primeiro tick >= 120 = ~122s     <- pagava 122 achando que pagava 120
+#   50   -> primeiro tick >=  50 =  ~73s     <- perdeu o tick de 49 por 1,5s
+#   45   -> primeiro tick >=  45 =  ~49s
+#
+# O 50 foi tentado em produção neste mesmo dia e mediu 74/72/73/73s. Foi o que
+# provou a quantização: 5 segundos a menos no número valem 24 segundos a menos
+# de atraso, e 10 a mais não valem nada. ESCOLHA PELA FAIXA, NÃO PELO NÚMERO
+# REDONDO -- 60 e 70 são o MESMO ~73s que 50; 110 e 120 são o mesmo ~122s.
+#
+# 45 e não 49: a volta oscila até ~29s, e um alvo colado no tick fica refém
+# dessa oscilação. 45 dispara no segundo tick nas duas pontas da banda.
+#
+# O atraso ponta a ponta, medido: espera pela varredura + a busca no CAMPO (18 a
+# 25s) + processar até notificar (~1,3s). Com 120 dava pior caso ~2min40, que
+# foi o que a operação relatou; com 45, ~1min15.
+#
+# O portão de memória acima foi conferido antes da mudança, e com os dois pontos
+# que ele pedia: 227 MB de RSS recém-subido, 236 MB após 8h40 e ~240 varreduras.
+# São ~9 MB no turno inteiro, ou ~0,04 MB/varredura -- duas ordens de grandeza
+# abaixo dos 2,6 do portão, e longe dos 14 do número de campo antigo (que daria
+# ~3,3 GB nessas 240). É o vazamento do page.on+json, já corrigido, saindo da
+# conta. Nas ~880 varreduras/turno que 45s traz isso dá ~35 MB, contra
+# LIMITE_RAM_BOT_MB de 4500.
+#
+# CUIDADO AO REMEDIR: `ps --sort=-rss | head -1` pega o SITE (iniciar_site.py,
+# ~340 MB), não o bot. Meça pelo PID: systemctl show -p MainPID --value campo-bot.
+#
+# POR QUE 45 E NÃO 25, com a RAM liberando: 25s cairia no PRIMEIRO tick (~24,5s)
+# e são ~1.760 varreduras por turno, 7x as requisições no CAMPO. O CAMPO não é nosso
+# e não temos medida de como ele reage a isso. 45s dá ~880/turno (3,6x) e já
+# entrega mais da metade do atraso; se um dia 25 for necessário, meça a resposta
+# do CAMPO antes, não a nossa RAM.
+INTERVALO_VARREDURA_COMPLETA_SEG = 45
 
 # Sessão HTTP da varredura de chamados, fora do Playwright.
 #
@@ -1125,6 +1182,157 @@ def atualizar_capex_pendente(qtd_sul_rj, qtd_litoral_sp):
         _salvar_estado_estatisticas_status()
 
 
+# ================= ESTADO DA MÁQUINA (bloco do /status) =================
+# Pedido em 14/08/2026: o /status contava o que o bot fez, mas nada sobre o
+# chão em que ele pisa. Numa máquina só, rodando bot + site + Chromium + VPN,
+# "o bot está lento" e "a máquina está sem RAM" são perguntas diferentes e a
+# segunda não tinha resposta sem SSH.
+
+# UNIDADE FIXA POR SEÇÃO, e não a "melhor" para cada número. Máquina em GB,
+# processo em MB. Misturar as duas -- 1.6 GB numa linha e 378 MB na seguinte --
+# obriga quem lê a converter de cabeça justamente para comparar, que é a única
+# coisa que se faz com esses números.
+def _gb(n):
+    return (n or 0) / (1024 ** 3)
+
+
+def _mb(n):
+    return (n or 0) / (1024 ** 2)
+
+
+def _fmt_duracao(segundos):
+    """Compacto de propósito: estas linhas dividem largura com o resto do
+    bloco alinhado, e "13h 39min" custa 4 caracteres a mais que "13h39"."""
+    if segundos is None:
+        return "?"
+    segundos = int(segundos)
+    dias, resto = divmod(segundos, 86400)
+    horas, resto = divmod(resto, 3600)
+    minutos = resto // 60
+    if dias:
+        return f"{dias}d{horas}h"
+    return f"{horas}h{minutos:02d}" if horas else f"{minutos}min"
+
+
+def _rotulo_processo(info):
+    """Nome útil de um processo. `python3` e `node` sozinhos não dizem nada: na
+    produção há quatro python3 e o que os distingue é o script."""
+    nome = str(info.get('name') or '?')
+    if nome.lower().startswith(('python', 'node')):
+        for parte in (info.get('cmdline') or [])[1:]:
+            if parte.startswith('-'):
+                continue
+            base = os.path.basename(parte)
+            if base:
+                return base
+    return nome
+
+
+def montar_bloco_maquina():
+    """Estado da máquina, em texto, para o /status.
+
+    NUNCA levanta: cada medida vai no seu try. Um /status sem o bloco da
+    máquina ainda responde o que a operação foi perguntar; um /status que
+    estoura por causa de um contador de CPU não responde nada.
+    """
+    if not _PSUTIL_DISPONIVEL:
+        return "\n\n🖥️ *Máquina*: indisponível (psutil não instalado)."
+
+    # Tudo dentro de UM bloco ```: é o que dá fonte monoespaçada no Telegram e
+    # no WhatsApp, e sem ela nenhum alinhamento por espaço sobrevive. Um bloco
+    # só, e não dois, para não virar duas caixas cinzentas na conversa.
+    #
+    # Largura alvo: 36 colunas. Acima disso a bolha do WhatsApp quebra a linha
+    # no celular e o alinhamento que se pagou para ter vai embora.
+    linhas = []
+
+    try:
+        mem = psutil.virtual_memory()
+        livre_ram = _gb(mem.available)
+        # Campos de 5 e 6: o disco chega a "131.5 / 208.0" e um campo curto
+        # demais empurra a barra, desalinhando justamente as duas linhas que
+        # existem para ser comparadas.
+        linhas.append(
+            f"{'RAM':<7}{_gb(mem.total - mem.available):>5.1f} /"
+            f"{_gb(mem.total):>6.1f} GB {mem.percent:>3.0f}%"
+        )
+    except Exception:
+        livre_ram = None
+
+    try:
+        # A partição do próprio bot, e não '/': se um dia ele morar em disco
+        # separado, é o dele que enche primeiro (log, PNG, JSON de 5 MB).
+        disco = psutil.disk_usage(os.path.dirname(os.path.abspath(__file__)))
+        linhas.append(
+            f"{'Disco':<7}{_gb(disco.used):>5.1f} /"
+            f"{_gb(disco.total):>6.1f} GB {disco.percent:>3.0f}%"
+        )
+        livre_disco = _gb(disco.free)
+    except Exception:
+        livre_disco = None
+
+    # O que sobra, na mesma linha: "usada x livre" é a pergunta, e as duas
+    # metades separadas por três linhas não se comparam de relance.
+    if livre_ram is not None or livre_disco is not None:
+        partes = []
+        if livre_ram is not None:
+            partes.append(f"{livre_ram:>5.1f} GB RAM")
+        if livre_disco is not None:
+            partes.append(f"{livre_disco:.0f} GB disco")
+        linhas.append(f"{'Livre':<7}" + " · ".join(partes))
+
+    try:
+        # interval curto e BLOQUEANTE: com interval=None a primeira chamada de
+        # cada processo devolve 0,0%, porque psutil precisa de duas amostras.
+        cpu = psutil.cpu_percent(interval=0.3)
+        nucleos = psutil.cpu_count()
+        if hasattr(os, "getloadavg"):
+            # "carga 0.30/8" e não "carga 0.30": carga sozinha não se lê sem
+            # saber contra quantos núcleos ela corre.
+            resto = f"  carga {os.getloadavg()[0]:.2f}/{nucleos}"
+        else:
+            resto = f"  {nucleos} núcleos"   # Windows não tem load average
+        linhas.append(f"{'CPU':<7}{cpu:>5.0f}%{resto}")
+    except Exception:
+        pass
+
+    try:
+        linhas.append(
+            f"{'Uptime':<7}máq {_fmt_duracao(time.time() - psutil.boot_time())}"
+            f" · bot {_fmt_duracao(time.time() - psutil.Process().create_time())}"
+        )
+    except Exception:
+        pass
+
+    try:
+        vistos = []
+        for proc in psutil.process_iter(['name', 'cmdline', 'memory_info']):
+            try:
+                info = proc.info
+                mi = info.get('memory_info')
+                rss = mi.rss if mi else 0
+            except Exception:
+                continue   # processo morreu entre listar e ler: normal
+            if rss:
+                vistos.append((rss, _rotulo_processo(info)))
+        if vistos:
+            vistos.sort(reverse=True)
+            linhas.append(f"{'Proc':<7}{len(vistos):>5d} em execução")
+            # Nome cortado em 21 com reticência: é o que mantém a coluna dos MB
+            # reta. Sem o corte, um processo de nome comprido desloca só a linha
+            # dele e a lista deixa de se ler de relance.
+            linhas.append("")
+            for rss, nome in vistos[:5]:
+                curto = nome if len(nome) <= 21 else nome[:20] + "…"
+                linhas.append(f"{curto:<22}{_mb(rss):>5.0f} MB")
+    except Exception:
+        pass
+
+    if not linhas:
+        return "\n\n🖥️ *Máquina*: não consegui medir."
+    return "\n\n🖥️ *Máquina*\n```\n" + "\n".join(linhas) + "\n```"
+
+
 def montar_mensagem_status():
     with _stats_lock:
         _resetar_stats_diarias_se_necessario()
@@ -1159,6 +1367,7 @@ def montar_mensagem_status():
         f"Improdutivas notificadas hoje: {improdutivas_notif}\n"
         f"Erros registrados no LOG hoje: {erros}\n"
         f"TOTAL de O.S analisadas por minuto: {os_por_minuto:.1f}"
+        f"{montar_bloco_maquina()}"
     )
 
 
@@ -6577,11 +6786,17 @@ def executar_monitoramento(exibir=None):
                 except Exception:
                     logger.exception("Falha ao checar/reavaliar a Base OFS atualizada.")
 
-            def processar_lista_chamados(lista_chamados, capex_confiavel=True):
+            def processar_lista_chamados(lista_chamados, capex_confiavel=True,
+                                         reparos_confiavel=True):
                 """capex_confiavel=False quando a lista chegou truncada. Nesse
                 caso as O.S. novas ainda são notificadas, mas a contagem de
                 CAPEX pendente NÃO é regravada -- senão o site mostra 0 (ou um
                 número menor) até a próxima varredura boa.
+
+                reparos_confiavel=False quando QUALQUER uma das duas buscas veio
+                cortada. Aí o conjunto de reparos abertos não é publicado. As
+                duas flags andam separadas de propósito -- ver o docstring de
+                buscar_chamados_via_api.
 
                 O parâmetro `origem` saiu em 08/08/2026 junto com o listener
                 que lia chamados: agora só a varredura chama isto, então toda
@@ -6900,7 +7115,13 @@ def executar_monitoramento(exibir=None):
                 # uma lista subcontada faria a reavaliação concluir que
                 # chamados abertos estão fechados, e calar garantia de verdade
                 # -- erro pior que o que esta trava veio consertar.
-                if capex_confiavel:
+                #
+                # `reparos_confiavel` e não `capex_confiavel`: o conjunto aqui é
+                # a UNIÃO das duas buscas, então basta uma delas vir cortada
+                # para ele sair menor que a realidade. Até 14/08/2026 esta linha
+                # olhava só a busca 1, e às 10:27 daquele dia publicou 673
+                # chamados no lugar de 1.684 sem nenhum aviso.
+                if reparos_confiavel:
                     publicar_reparos_abertos(os_reparo_abertas)
 
                 if capex_confiavel:
@@ -7003,18 +7224,36 @@ def executar_monitoramento(exibir=None):
                 return todos, False, completa
 
             def buscar_chamados_via_api():
-                """Devolve (tentou, deslogado, chamados, capex_confiavel).
+                """Devolve (tentou, deslogado, chamados, capex_confiavel,
+                reparos_confiavel).
 
-                capex_confiavel só é True quando a busca 1 (CAPEX+ES05 por
-                unidade) percorreu todas as páginas. É ela que alimenta a
-                contagem de CAPEX pendente do site; se vier truncada, a
-                contagem sai menor que a real e não pode sobrescrever a boa.
+                SÃO DUAS GARANTIAS DIFERENTES, e por isso duas flags. Até
+                14/08/2026 existia só a primeira, e a completude da busca 2 era
+                atribuída a `_completa2` e descartada -- o furo abaixo.
+
+                capex_confiavel: a busca 1 (CAPEX+ES05 por unidade) percorreu
+                    todas as páginas. É ela que alimenta a contagem de CAPEX
+                    pendente do site; truncada, a contagem sai menor que a real
+                    e não pode sobrescrever a boa.
+
+                reparos_confiavel: as DUAS buscas vieram inteiras. É o que
+                    autoriza publicar o conjunto de reparos abertos, porque ele
+                    é a união das duas -- e um conjunto subcontado faz a
+                    reavaliação concluir que reparo aberto foi fechado, calando
+                    garantia de verdade.
+
+                Amarrar as duas seria errado nos dois sentidos: uma falha de
+                rede na busca 2 congelaria a contagem de CAPEX sem motivo, e uma
+                busca 1 truncada não pode publicar reparos ainda que a 2 esteja
+                boa. Em 14/08/2026, às 10:27, a busca 2 voltou com 290 de ~1.419
+                (falha de rede na página 1) e a varredura foi tratada como
+                completa: 673 chamados no lugar de 1.684, sem um aviso sequer.
                 """
                 url_base = estado_sessao['url_chamados_base']
                 token = estado_sessao['token_atual']
 
                 if not url_base or not token:
-                    return False, False, [], False
+                    return False, False, [], False, False
 
                 if 'all_buckets' in url_base:
                     url_base = url_base.replace('all_buckets', '')
@@ -7054,29 +7293,50 @@ def executar_monitoramento(exibir=None):
                     raise   # o laço externo precisa reabrir o navegador
                 except Exception as e:
                     logger.warning(f"Falha na busca CAPEX+ES05 (unidades): {e}")
-                    return True, False, [], False
+                    return True, False, [], False, False
 
                 if deslogado1:
                     logger.warning("Busca 1 retornou 401/403 — sessão deslogada.")
-                    return True, True, [], False
+                    return True, True, [], False, False
 
-                payload2 = {
-                    "enderecoUnidade": [],
-                    "dataConclusao": "IS NULL",
-                    "fila_codigo": ["ES05"],
-                    "contrato": None
-                }
-                try:
-                    chamados2, deslogado2, _completa2 = buscar_todas_paginas(url_base, payload2, headers)
-                except ContextoNavegadorMorto:
-                    raise   # o laço externo precisa reabrir o navegador
-                except Exception as e:
-                    logger.warning(f"Falha na busca ES05 global: {e}")
-                    chamados2, deslogado2 = [], False
+                # Busca 2: reparo nas siglas fora da nossa área.
+                #
+                # Era uma varredura NACIONAL (`enderecoUnidade: []`) até
+                # 14/08/2026. Medido antes de trocar: 1.419 dos 1.672 chamados
+                # de cada volta (85%), 5 páginas, e 6.607 dos 7.361 registros de
+                # reparos_avaliados.json -- para 0 garantias em 24 notificadas
+                # no histórico, e 0 entre os 3.122 reparos que estavam abertos
+                # fora das nossas siglas no momento da medição.
+                #
+                # O mecanismo que ela cobria continua coberto, e é o mesmo:
+                # garantia de serviço nosso executado fora da área. Só que agora
+                # o alvo é declarado em SIGLAS_GARANTIA_EXTRA em vez de varrido.
+                #
+                # Lista vazia => a busca não sai. Mandar `enderecoUnidade: []`
+                # para "não quero nenhuma" devolveria o país inteiro de novo,
+                # que é exatamente o oposto.
+                # completa2 nasce True porque "não havia o que buscar" é um
+                # resultado íntegro: com a lista vazia não existe reparo fora da
+                # área para perder. É diferente de "busquei e veio cortado".
+                chamados2, deslogado2, completa2 = [], False, True
+                if SIGLAS_GARANTIA_EXTRA:
+                    payload2 = {
+                        "enderecoUnidade": list(SIGLAS_GARANTIA_EXTRA),
+                        "dataConclusao": "IS NULL",
+                        "fila_codigo": ["ES05"],
+                        "contrato": None
+                    }
+                    try:
+                        chamados2, deslogado2, completa2 = buscar_todas_paginas(url_base, payload2, headers)
+                    except ContextoNavegadorMorto:
+                        raise   # o laço externo precisa reabrir o navegador
+                    except Exception as e:
+                        logger.warning(f"Falha na busca ES05 das siglas extras: {e}")
+                        chamados2, deslogado2, completa2 = [], False, False
 
                 if deslogado2:
                     logger.warning("Busca 2 retornou 401/403 — sessão deslogada.")
-                    return True, True, [], False
+                    return True, True, [], False, False
 
                 ids_vistos = set()
                 todos = []
@@ -7088,7 +7348,13 @@ def executar_monitoramento(exibir=None):
                         ids_vistos.add(cid)
                         todos.append(c)
 
-                return True, False, todos, completa1
+                if not completa2:
+                    logger.warning(
+                        "Busca das siglas extras veio TRUNCADA: o conjunto de "
+                        "reparos abertos não será publicado neste ciclo."
+                    )
+
+                return True, False, todos, completa1, (completa1 and completa2)
 
             # REMOVIDO em 08/08/2026: `salvar_diagnostico_requisicao_sucesso`.
             # Só era chamada pelo ramo do listener que lia o corpo da resposta
@@ -7286,6 +7552,15 @@ def executar_monitoramento(exibir=None):
                     raise Exception("Não foi possível carregar a lista de chamados.")
 
                 logger.info("Monitoramento iniciado. Atualizando a cada ~25 segundos...")
+                # A CONTAGEM, não os nomes: lista vazia é o estado que precisa
+                # gritar, porque aí a busca extra simplesmente não sai. Sigla
+                # errada (o caso `PBS`) aparece pelo outro lado, no
+                # "Busca paginada concluída" da busca 2 vindo com 0 chamados.
+                logger.info(
+                    "Reparo de garantia fora da nossa área: %s",
+                    f"{len(SIGLAS_GARANTIA_EXTRA)} sigla(s) vigiada(s)."
+                    if SIGLAS_GARANTIA_EXTRA else "busca extra desligada."
+                )
 
                 ciclos_vazios_seguidos = 0
                 # 0.0 faz a PRIMEIRA volta já rodar a varredura completa -- senão
@@ -7428,9 +7703,9 @@ def executar_monitoramento(exibir=None):
                         # intervalo continua contando a partir da tentativa, e não
                         # vira uma sequência de varreduras coladas.
                         ultima_varredura_completa_ts = time.time()
-                        tentou, deslogado_api, lista_chamados, capex_confiavel = buscar_chamados_via_api()
+                        tentou, deslogado_api, lista_chamados, capex_confiavel, reparos_confiavel = buscar_chamados_via_api()
                     else:
-                        tentou, deslogado_api, lista_chamados, capex_confiavel = False, False, [], False
+                        tentou, deslogado_api, lista_chamados, capex_confiavel, reparos_confiavel = False, False, [], False, False
                         # Batida VISÍVEL no log, uma linha por volta.
                         #
                         # Sem ela, as voltas puladas não escrevem nada e o log fica
@@ -7508,7 +7783,11 @@ def executar_monitoramento(exibir=None):
                         # Recebe a lista CRUA de propósito: a extração de
                         # telefone desce na estrutura aninhada, que a projeção
                         # não tem. Depois daqui ela pode ser liberada.
-                        processar_lista_chamados(lista_chamados, capex_confiavel=capex_confiavel)
+                        processar_lista_chamados(
+                            lista_chamados,
+                            capex_confiavel=capex_confiavel,
+                            reparos_confiavel=reparos_confiavel,
+                        )
                     elif varreu_agora:
                         # Só recarrega quando a varredura REALMENTE foi tentada e
                         # falhou. Nas voltas em que ela foi pulada de propósito não

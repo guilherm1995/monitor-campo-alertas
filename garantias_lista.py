@@ -33,13 +33,29 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# As mesmas regiões do resto do bot. BERT e BERTN entram no litoral aqui pelo
-# mesmo motivo do termômetro: eles fazem parte do LITORAL_SP que a notificação
-# individual monitora, e uma garantia dessas unidades tem de cair no grupo do
-# litoral em vez de sumir da lista por não estar em nenhuma região.
-LITORAL_SP = ['CGT', 'BASE', 'SST', 'SSTBO', 'IBL', 'BERT', 'BERTN']
+# ONDE A GARANTIA APARECE -- que não é a mesma coisa que onde o bot monitora.
+#
+# Estas listas são MAIORES que as do bot_campo_monitoramento de propósito. Lá
+# LITORAL_SP e RJ dizem onde fazemos monitoramento completo: alerta de entrante
+# CAPEX, backlog, tudo. Aqui elas dizem só em qual grupo uma garantia é
+# exibida.
+#
+# BERT e BERTN entram no litoral pelo mesmo motivo do termômetro: fazem parte
+# do LITORAL_SP que a notificação individual monitora, e uma garantia dessas
+# unidades tem de cair no grupo do litoral em vez de sumir da lista.
+#
+# UTB e CBF entraram em 14/08/2026, quando a busca de reparo passou a cobrir as
+# siglas fora da nossa área (SIGLAS_GARANTIA_EXTRA, no bot). Sem eles aqui, uma
+# garantia em Ubatuba ou Cabo Frio seria capturada e notificada individualmente,
+# mas cairia em `sem_regiao` na lista de hora em hora -- avisada uma vez e
+# ausente da consulta consolidada. Ampliar a captura sem dar destino é meio
+# caminho.
+#
+# NÃO copie estas listas de volta para o bot: lá elas ligariam alerta de CAPEX
+# e backlog em Ubatuba e Cabo Frio, que não roteirizamos.
+LITORAL_SP = ['CGT', 'BASE', 'SST', 'SSTBO', 'IBL', 'BERT', 'BERTN', 'UTB']
 RJ = ['RSD', 'MPE', 'VAS', 'VRD', 'PNDO', 'VLC', 'IZA', 'TRS', 'BMA',
-      'PORE', 'COLG', 'BPI', 'PFS', 'PDS', 'PNHE']
+      'PORE', 'COLG', 'BPI', 'PFS', 'PDS', 'PNHE', 'CBF']
 
 # chave -> (nome que aparece no título, siglas). A chave é o que o serviço do
 # WhatsApp entende como "destino" (ver REGRAS_GRUPO_REGIAO no index.js).
@@ -57,6 +73,7 @@ CIDADES = {
     "BMA": "Barra Mansa", "PORE": "Porto Real",
     "COLG": "Comendador Levy Gasparian", "BPI": "Barra do Piraí",
     "PFS": "Paty do Alferes", "PDS": "Paraíba do Sul", "PNHE": "Pinheiral",
+    "UTB": "Ubatuba", "CBF": "Cabo Frio",
 }
 
 
