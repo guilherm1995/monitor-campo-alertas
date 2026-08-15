@@ -66,9 +66,16 @@ def _linha(item):
 # distingue uma mudança de endereço de uma ativação -- cortado em "IFI de …"
 # ele vira ruído. CONTATO leva 250px para caber um telefone inteiro; o segundo,
 # quando há dois, pode cortar sem prejuízo.
+#
+# CONTRATO é a única coluna que NÃO pode cortar nunca: é o dado que a pessoa
+# usa para procurar o cliente no Autenticador ou no OFS, e meio número não serve para
+# nada -- pior, "6890…" parece um número. Os 130px de 13/08/2026 davam 102px
+# úteis contra os ~116px que 7 dígitos ocupam em Consolas 30px bold: TODO
+# contrato saía truncado. Os 200px de agora cabem 10 dígitos, folga para o dia
+# em que aparecer contrato mais longo.
 _COLGROUP = """
         <colgroup>
-          <col style="width:130px">
+          <col style="width:200px">
           <col style="width:250px">
           <col style="width:150px">
           <col style="width:100px">
@@ -150,8 +157,11 @@ def _estilo():
     box-shadow: 0 4px 18px rgba(0,0,0,0.35);
     /* Largura fixa: o body é fit-content, e sem uma medida aqui cada bloco
        encolheria até o seu próprio conteúdo -- blocos de larguras diferentes
-       empilhados um sobre o outro. */
-    width: 1600px;
+       empilhados um sobre o outro.
+       1600 -> 1680 quando CONTRATO ganhou 70px: crescer o bloco é o que
+       impede a conta de ser paga por BAIRRO, que é a coluna sem largura fixa
+       e portanto quem absorve qualquer aumento das outras. */
+    width: 1680px;
   }}
   .titulo-cidade {{
     color: {COR_DESTAQUE};
@@ -214,7 +224,7 @@ def _estilo():
     color: {COR_VERDE};
     font-size: 34px;
     font-weight: 600;
-    width: 1600px;
+    width: 1680px;
   }}
 """
 
@@ -262,7 +272,7 @@ def gerar_html_garantias(dados, chave_regiao):
 </html>"""
 
 
-def gerar_imagem_garantias(dados, chave_regiao, pasta_saida=None, largura=1700):
+def gerar_imagem_garantias(dados, chave_regiao, pasta_saida=None, largura=1780):
     """Gera o PNG da região e devolve o caminho do arquivo."""
     pasta_saida = pasta_saida or os.path.join(os.getcwd(), "relatorios")
     os.makedirs(pasta_saida, exist_ok=True)

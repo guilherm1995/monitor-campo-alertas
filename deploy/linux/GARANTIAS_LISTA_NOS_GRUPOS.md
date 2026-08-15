@@ -77,6 +77,73 @@ sozinha, sem ninguém dar baixa.
 > registra no log. Uma lista vazia no grupo se leria como "nenhuma garantia
 > pendente", que é o oposto de "ainda não sei".
 
+### As duas buscas que alimentam "ainda abertas"
+
+A varredura faz **duas** requisições ao CAMPO, e elas se dividem por regra, não
+por sigla:
+
+| | Unidades | Filas |
+|---|---|---|
+| Busca 1 | as 22 siglas nossas | CAPEX + ES05 + ES06 + REPPME + UP02 + ES15 |
+| Busca 2 | `SIGLAS_GARANTIA_EXTRA` | só ES05 |
+
+Nas nossas siglas queremos tudo: entrante, backlog e reparo. Fora delas
+queremos **só reparo** — não roteirizamos entrante em Ubatuba nem em Cabo
+Frio, e o backlog dali não é nosso. Como a API aceita uma lista de filas por
+requisição, "tudo nestas 22, só ES05 nestas 2" não cabe numa chamada só.
+
+> Os reparos das nossas siglas sempre vieram da **busca 1**. A busca 2 é o
+> delta: o que a busca 1 não enxerga sem arrastar junto o que não queremos.
+
+Até 14/08/2026 a busca 2 era **nacional** (`enderecoUnidade: []`). Medido antes
+de trocar: 1.419 dos 1.672 chamados de cada volta, 5 páginas, 90% do
+`reparos_avaliados.json` — e **0 garantias** em 24 notificadas no histórico.
+
+#### ⚠️ A lista é do vocabulário do CAMPO, não do da Base OFS
+
+Os dois divergem, e a divergência é **silenciosa**. A Base OFS escrevia `PBS`
+(84 linhas, cidade Paraíba do Sul); o CAMPO nunca devolveu esse código — 0 em
+7.361 registros. O contrato daquelas linhas que teve reparo apareceu sob
+`PDS`, que já estava na lista do RJ.
+
+Pôr `PBS` em `SIGLAS_GARANTIA_EXTRA` teria sido um filtro que nunca casa:
+busca vazia, sem erro nenhum, garantia real não notificada.
+
+**Antes de acrescentar uma sigla ali**, confirme que o CAMPO realmente a emite —
+conte `unidade` em `dados/reparos_avaliados.json`. Que ela apareça na `Chave
+Workzone` da base não prova nada.
+
+### Capturar não é o mesmo que exibir
+
+Ampliar a busca não basta: a sigla também precisa cair em alguma região, senão
+a garantia é notificada uma vez no alerta individual e **some da lista
+consolidada**, em `sem_regiao`.
+
+Por isso `garantias_lista.py` tem listas **maiores** que as do bot:
+
+| | `bot_campo_monitoramento` | `garantias_lista` |
+|---|---|---|
+| significa | onde há monitoramento completo | onde a garantia é exibida |
+| litoral | …, BERT, BERTN | …, BERT, BERTN, **UTB** |
+| RJ | …, PDS, PNHE | …, PDS, PNHE, **CBF** |
+
+Não copie as de `garantias_lista` de volta para o bot: lá elas ligariam alerta
+de CAPEX e backlog em Ubatuba e Cabo Frio.
+
+### Duas garantias, duas travas
+
+O conjunto de reparos abertos só é publicado quando as **duas** buscas vieram
+inteiras (`reparos_confiavel`). A contagem de CAPEX depende só da busca 1
+(`capex_confiavel`). São flags separadas de propósito: amarrá-las faria uma
+falha de rede na busca 2 congelar a contagem de CAPEX sem motivo.
+
+> Até 14/08/2026 existia só a primeira, e a completude da busca 2 era
+> descartada. Às 10:27 daquele dia a busca 2 voltou com 290 de ~1.419 (falha de
+> rede na página 1) e a varredura foi tratada como completa: 673 chamados no
+> lugar de 1.684, **sem um aviso sequer**. Um conjunto subcontado faz a
+> reavaliação concluir que reparo aberto foi fechado — e calar garantia de
+> verdade.
+
 ---
 
 ## 3. As colunas
@@ -231,6 +298,8 @@ Para desligar o envio automático sem mexer no código:
 | | |
 |---|---|
 | Regra da lista, regiões e texto | `bot/garantias_lista.py` |
+| Siglas fora da nossa área | mesmo arquivo do bot, `SIGLAS_GARANTIA_EXTRA` |
+| As duas buscas e as duas travas | mesmo arquivo, `buscar_chamados_via_api` |
 | A imagem | `bot/garantias_render.py` |
 | Envio e agendador | `bot/garantias_envio.py` |
 | Fonte das notificadas | `bot/dados/reparos_avaliados.json` |
