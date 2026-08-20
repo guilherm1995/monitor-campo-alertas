@@ -37,62 +37,112 @@ _SLUG_CATEGORIA = {
 }
 
 
+# Faixas do farol de conexão, medidas sobre a fatia de loss. Loss é o que
+# dói: contrato que o Autenticador vê desconectado é visita que tem grande chance de
+# voltar improdutiva.
+LOSS_ATENCAO = 25.0     # a partir daqui, amarelo
+LOSS_CRITICO = 50.0     # a partir daqui, vermelho
+
+
 def _fmt_pct(valor):
     return f"{valor:.1f}".rstrip("0").rstrip(".") + "%" if valor else "0%"
+
+
+def _cel(valor, cor=None, extra="", texto=None):
+    """Uma célula. A cor entra SÓ quando há o que sinalizar.
+
+    Antes a classe de cor era fixa por COLUNA: a célula de "acima de 7 dias"
+    saía vermelha mesmo valendo 0, e a de "vencida" também. O resultado era uma
+    tabela coberta de blocos vermelhos e amarelos onde não havia problema
+    nenhum -- e farol que acende sempre não é farol, é papel de parede: quem
+    olha para de distinguir o dia ruim do dia normal.
+
+    Zero não é "tudo certo" nem "problema": é nada a dizer. Fica neutro.
+    """
+    classes = ["cel"]
+    if extra:
+        classes.append(extra)
+    if cor and valor:
+        classes.append(cor)
+    return f'<td class="{" ".join(classes)}">{valor if texto is None else texto}</td>'
+
+
+def _farol_conexao(conectados, loss):
+    """Cor do par conectado/loss, pela gravidade -- não pelo nome da coluna.
+
+    As duas células recebem a MESMA cor de propósito: elas são uma informação
+    só, lida de relance. "18,2% conectado" em vermelho diz a mesma coisa que
+    "81,8% de loss" em vermelho, e ver as duas concordando custa menos que
+    comparar dois números.
+
+    Sem dado do Autenticador não há cor. 0 conectado e 0 loss não é uma base
+    saudável: é uma base que ninguém conseguiu consultar, e pintar isso de
+    verde seria inventar uma boa notícia.
+    """
+    total = (conectados or 0) + (loss or 0)
+    if not total:
+        return None
+    pct_loss = 100.0 * (loss or 0) / total
+    if pct_loss >= LOSS_CRITICO:
+        return "vermelho"
+    if pct_loss >= LOSS_ATENCAO:
+        return "amarelo"
+    return "verde"
 
 
 def _linha_tabela(unidade, linha_idade, linha_agenda, categoria, destaque=False):
     classe_total = " linha-total" if destaque else ""
     nome_exibido = "TOTAL" if destaque else unidade
 
+    b1, b2, b3 = linha_idade['bucket1'], linha_idade['bucket2'], linha_idade['bucket3']
+
+    # A porcentagem herda a cor da CONTAGEM que ela descreve, não do próprio
+    # valor: são a mesma informação em duas unidades, e discordarem na cor
+    # confundiria mais do que ajuda.
+    celulas_idade = (
+        _cel(b1, "verde")
+        + _cel(b1, "verde", "pct", texto=_fmt_pct(linha_idade['pct_bucket1']))
+        + _cel(b2, "amarelo")
+        + _cel(b2, "amarelo", "pct", texto=_fmt_pct(linha_idade['pct_bucket2']))
+        + _cel(b3, "vermelho")
+        + _cel(b3, "vermelho", "pct", texto=_fmt_pct(linha_idade['pct_bucket3']))
+        + f'<td class="cel total-col">{linha_idade["total"]}</td>'
+        + _cel(linha_idade['enviado_d0'])
+        + _cel(linha_idade['conveniencia'])
+        + _cel(linha_idade['oportunidade_injecao'], "destaque-col")
+    )
+
+    celulas_agenda = (
+        _cel(linha_agenda['d1'], extra="sep-esq")
+        + _cel(linha_agenda['d2'])
+        + _cel(linha_agenda['d3'])
+        + _cel(linha_agenda['mais_d3'])
+        + _cel(linha_agenda['vencida'], "vermelho", "sep-esq")
+        + _cel(linha_agenda['no_prazo'], "verde")
+    )
+
     # Para Reparo/Upgrade/Mudança de Cômodo, mostramos conectados/loss
     mostra_autenticador = "conectados" in linha_idade and "loss" in linha_idade
     if mostra_autenticador:
-        return f"""
-    <tr class="linha{classe_total}">
-      <td class="col-unidade">{nome_exibido}</td>
-      <td class="cel verde">{linha_idade['bucket1']}</td>
-      <td class="cel verde pct">{_fmt_pct(linha_idade['pct_bucket1'])}</td>
-      <td class="cel amarelo">{linha_idade['bucket2']}</td>
-      <td class="cel amarelo pct">{_fmt_pct(linha_idade['pct_bucket2'])}</td>
-      <td class="cel vermelho">{linha_idade['bucket3']}</td>
-      <td class="cel vermelho pct">{_fmt_pct(linha_idade['pct_bucket3'])}</td>
-      <td class="cel total-col">{linha_idade['total']}</td>
-      <td class="cel">{linha_idade['enviado_d0']}</td>
-      <td class="cel">{linha_idade['conveniencia']}</td>
-      <td class="cel destaque-col">{linha_idade['oportunidade_injecao']}</td>
-      <td class="cel verde">{linha_idade['conectados']}</td>
-      <td class="cel vermelho">{linha_idade['loss']}</td>
-      <td class="cel verde pct">{_fmt_pct(linha_idade['pct_conectado'])}</td>
-      <td class="cel vermelho pct">{_fmt_pct(linha_idade['pct_loss'])}</td>
-      <td class="cel sep-esq">{linha_agenda['d1']}</td>
-      <td class="cel">{linha_agenda['d2']}</td>
-      <td class="cel">{linha_agenda['d3']}</td>
-      <td class="cel">{linha_agenda['mais_d3']}</td>
-      <td class="cel vermelho sep-esq">{linha_agenda['vencida']}</td>
-      <td class="cel verde">{linha_agenda['no_prazo']}</td>
-    </tr>"""
+        conectados, loss = linha_idade['conectados'], linha_idade['loss']
+        farol = _farol_conexao(conectados, loss)
+        celulas_autenticador = (
+            _cel(conectados, "verde")
+            + _cel(loss, "vermelho")
+            # O que decide se pinta é HAVER dado do Autenticador, não o valor de
+            # cada célula: com 0 conectado e 1 loss, olhar só o conectado
+            # deixaria "0%" cinza ao lado de "100%" vermelho -- o par diria
+            # duas coisas sobre o mesmo fato.
+            + _cel(conectados + loss, farol, "pct", texto=_fmt_pct(linha_idade['pct_conectado']))
+            + _cel(conectados + loss, farol, "pct", texto=_fmt_pct(linha_idade['pct_loss']))
+        )
     else:
-        # CAPEX (sem Autenticador)
-        return f"""
+        celulas_autenticador = ""   # CAPEX não tem Autenticador
+
+    return f"""
     <tr class="linha{classe_total}">
       <td class="col-unidade">{nome_exibido}</td>
-      <td class="cel verde">{linha_idade['bucket1']}</td>
-      <td class="cel verde pct">{_fmt_pct(linha_idade['pct_bucket1'])}</td>
-      <td class="cel amarelo">{linha_idade['bucket2']}</td>
-      <td class="cel amarelo pct">{_fmt_pct(linha_idade['pct_bucket2'])}</td>
-      <td class="cel vermelho">{linha_idade['bucket3']}</td>
-      <td class="cel vermelho pct">{_fmt_pct(linha_idade['pct_bucket3'])}</td>
-      <td class="cel total-col">{linha_idade['total']}</td>
-      <td class="cel">{linha_idade['enviado_d0']}</td>
-      <td class="cel">{linha_idade['conveniencia']}</td>
-      <td class="cel destaque-col">{linha_idade['oportunidade_injecao']}</td>
-      <td class="cel sep-esq">{linha_agenda['d1']}</td>
-      <td class="cel">{linha_agenda['d2']}</td>
-      <td class="cel">{linha_agenda['d3']}</td>
-      <td class="cel">{linha_agenda['mais_d3']}</td>
-      <td class="cel vermelho sep-esq">{linha_agenda['vencida']}</td>
-      <td class="cel verde">{linha_agenda['no_prazo']}</td>
+      {celulas_idade}{celulas_autenticador}{celulas_agenda}
     </tr>"""
 
 
@@ -290,11 +340,19 @@ def _estilo_base():
     color: {COR_TEXTO_MUTED};
   }}
   tr.linha:nth-child(odd) td {{ background: {COR_CARD_ESCURO}55; }}
-  td.verde {{ background: {COR_VERDE_BG}; color: {COR_VERDE}; }}
-  td.amarelo {{ background: {COR_AMARELO_BG}; color: {COR_AMARELO}; }}
-  td.vermelho {{ background: {COR_VERMELHO_BG}; color: {COR_VERMELHO}; }}
-  td.total-col {{ background: {COR_DESTAQUE}22; color: {COR_DESTAQUE}; font-weight: 700; }}
-  td.destaque-col {{ background: {COR_DESTAQUE}22; color: {COR_DESTAQUE}; font-weight: 700; }}
+  /* Os seletores do farol carregam `tr.linha` de proposito. Sem isso a listra
+     acima -- (0,2,2) por causa do :nth-child -- ganhava de `td.verde` (0,1,1)
+     e APAGAVA o fundo colorido nas linhas impares. A tabela saia num xadrez
+     em que a mesma situacao aparecia pintada ou nao dependendo da posicao da
+     unidade na lista. Com `tr.linha td.verde` empata em (0,2,2) e vence por
+     vir depois. Pelo mesmo motivo a cor tem de vencer `td.cel.pct` (0,2,1),
+     que deixava as colunas de % sempre cinzas por mais grave que fosse o
+     numero ao lado. */
+  tr.linha td.verde {{ background: {COR_VERDE_BG}; color: {COR_VERDE}; }}
+  tr.linha td.amarelo {{ background: {COR_AMARELO_BG}; color: {COR_AMARELO}; }}
+  tr.linha td.vermelho {{ background: {COR_VERMELHO_BG}; color: {COR_VERMELHO}; }}
+  tr.linha td.total-col {{ background: {COR_DESTAQUE}22; color: {COR_DESTAQUE}; font-weight: 700; }}
+  tr.linha td.destaque-col {{ background: {COR_DESTAQUE}22; color: {COR_DESTAQUE}; font-weight: 700; }}
   td.sep-esq {{ border-left: 2px solid {COR_LINHA}; }}
   tr.linha-total td {{
     background: {COR_LINHA} !important;
