@@ -13,6 +13,7 @@
 # fica no log e a próxima hora resolve.
 
 import base64
+import json
 import logging
 import os
 import threading
@@ -34,6 +35,20 @@ logger = logging.getLogger(__name__)
 
 PASTA_SAIDA = os.environ.get(
     'GARANTIAS_PASTA_SAIDA', os.path.join(os.getcwd(), 'relatorios')
+)
+
+# A MESMA lista que vai para os grupos, gravada para o site ler.
+#
+# Antes o site montava a própria lista, a partir de um "chamados abertos"
+# exportado à mão do Field Service cruzado com a Base OFS -- 309 linhas
+# reimplementando a regra que já existe aqui. Duas implementações da mesma
+# pergunta dão duas respostas, e davam: a tela mostrava um número e o grupo
+# recebia outro, sem nada explicando a diferença.
+#
+# Agora há uma fonte só. O site lê este arquivo e mostra exatamente o que foi
+# enviado -- não uma segunda opinião sobre os mesmos fatos.
+ARQUIVO_PUBLICADO = os.environ.get(
+    'GARANTIAS_ARQUIVO_PUBLICADO', os.path.join(os.getcwd(), 'dados', 'garantias_lista.json')
 )
 
 # A janela pedida pela operação: primeiro envio às 7h, último às 19h.
@@ -148,7 +163,49 @@ def montar_dados(reparos_avaliados, os_abertas, com_autenticador=True):
                 "Falha ao consultar o Autenticador para a lista de garantias. "
                 "A lista vai sem o status de conexão."
             )
+    _publicar_para_o_site(dados)
     return dados
+
+
+def _publicar_para_o_site(dados):
+    """Grava a lista onde o site a lê. Nunca levanta.
+
+    Escrita atômica: grava num temporário e renomeia. O site pode abrir este
+    arquivo a qualquer instante, e `os.replace` troca o conteúdo de uma vez --
+    sem ele, uma leitura no meio da escrita pegaria JSON pela metade e a tela
+    quebraria por um motivo que não tem nada a ver com garantia nenhuma.
+
+    Falhar aqui não pode derrubar o envio: o grupo receber a lista importa
+    mais do que a tela ficar atualizada, e são coisas independentes.
+    """
+    try:
+        online = offline = 0
+        for regiao in dados.get('regioes', []):
+            for cidade in regiao.get('cidades', []):
+                for item in cidade.get('itens', []):
+                    if item.get('status') == 'ONLINE':
+                        online += 1
+                    elif item.get('status') == 'OFFLINE':
+                        offline += 1
+
+        conteudo = dict(dados)
+        conteudo['online'] = online
+        conteudo['offline'] = offline
+        conteudo['publicado_em'] = time.strftime('%Y-%m-%d %H:%M:%S')
+
+        destino = ARQUIVO_PUBLICADO
+        os.makedirs(os.path.dirname(destino), exist_ok=True)
+        temporario = destino + '.novo'
+        with open(temporario, 'w', encoding='utf-8') as arquivo:
+            json.dump(conteudo, arquivo, ensure_ascii=False, indent=1)
+        os.replace(temporario, destino)
+        logger.info("Lista de garantias publicada para o site: %d item(ns).",
+                    dados.get('total', 0))
+    except Exception:
+        logger.exception(
+            "Falha ao publicar a lista de garantias para o site. O envio aos "
+            "grupos segue normalmente; a tela é que fica com a lista anterior."
+        )
 
 
 def gerar_e_enviar(reparos_avaliados, os_abertas, carimbo_varredura=None,

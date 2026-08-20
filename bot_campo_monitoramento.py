@@ -230,7 +230,7 @@ AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP = {}
 #    no grupo e recebia listas por região. Não tinha memória e não cruzava com
 #    nada -- analisava, imprimia e esquecia.
 # 2. Foi APOSENTADO, e no lugar dele a mesma classificação de motivos passou a
-#    rodar sozinha a cada entrante, contra a base de 30 dias (improdutivas.py e
+#    rodar sozinha a cada entrante, contra a base de 60 dias (improdutivas.py e
 #    verificar_improdutiva_anterior). Isso continua valendo: é o alerta.
 # 3. VOLTOU, com outro corpo, quando ficou claro que alerta não é lista. O
 #    alerta é evento -- conta que algo aconteceu e some na conversa do grupo.
@@ -343,10 +343,10 @@ BASE_OFS_ARQUIVO = os.path.join(PASTA_DADOS, "base OFS ok.xlsx")
 # Base das improdutivas -- arquivo SEPARADO da base OFS, de propósito. A base
 # OFS é a exportação só de atividades concluídas e é dela que sai a garantia;
 # misturar as improdutivas ali significaria mexer numa base crítica que já
-# funciona. Esta aqui é a exportação dos últimos 30 dias SEM o filtro de
+# funciona. Esta aqui é a exportação dos últimos 60 dias SEM o filtro de
 # status, e serve a uma pergunta só: este entrante já foi improdutiva antes?
 # Sobe pelo site, como a outra, e chega aqui espelhada (ver planilhas.py).
-BASE_IMPRODUTIVAS_ARQUIVO = os.path.join(PASTA_DADOS, "base improdutivas 30 dias.xlsx")
+BASE_IMPRODUTIVAS_ARQUIVO = os.path.join(PASTA_DADOS, "base improdutivas 60 dias.xlsx")
 
 DIAS_GARANTIA_REPARO = 30
 DIAS_GARANTIA_ATIVACAO_MUDANCA = 15
@@ -2481,6 +2481,29 @@ def salvar_reparos_avaliados(reparos_avaliados):
         logger.exception("Falha ao salvar reparos_avaliados.json.")
 
 
+# A tabela de unidade -> região vem de garantias_lista.REGIOES: a MESMA que
+# decide para onde vai a lista de garantias de hora em hora. Repetir a lista de
+# unidades aqui criaria duas verdades sobre a mesma pergunta, e a divergência
+# apareceria do jeito mais confuso possível -- o alerta de uma unidade caindo
+# num grupo e a lista da mesma unidade caindo no outro.
+_UNIDADE_PARA_REGIAO = {
+    unidade: chave
+    for chave, (_nome, unidades) in garantias_lista.REGIOES.items()
+    for unidade in unidades
+}
+
+
+def regiao_da_unidade(unidade):
+    """Em qual grupo regional este alerta deve cair.
+
+    Unidade desconhecida devolve None, e None é o grupo principal. É de
+    propósito: unidade nova, ou digitada diferente da tabela, ainda tem de
+    chegar a alguém. Sumir em silêncio seria o pior desfecho -- ninguém
+    procura um alerta que não sabe que existia.
+    """
+    return _UNIDADE_PARA_REGIAO.get(str(unidade or '').strip().upper())
+
+
 def notificar_garantia_telegram(unidade, contrato, nome_cliente, bairro, telefones_str, tecnico_ofs):
     corpo_mensagem = (
         f"GARANTIA: {html.escape(str(unidade))}\n"
@@ -2491,14 +2514,15 @@ def notificar_garantia_telegram(unidade, contrato, nome_cliente, bairro, telefon
         f"• Técnico OFS: {html.escape(str(tecnico_ofs))}"
     )
     mensagem = f"<b>{corpo_mensagem}</b>"
-    return enviar_alerta_telegram(mensagem, parse_mode="HTML")
+    return enviar_alerta_telegram(mensagem, parse_mode="HTML",
+                                  destino=regiao_da_unidade(unidade))
 
 
 # ---------------------------------------------------------------------------
 # Reincidência de improdutiva técnica
 #
 # Pergunta feita a cada entrante de CAPEX: este cliente já teve uma
-# improdutiva nos últimos 30 dias? Se já teve, a visita que está entrando
+# improdutiva nos últimos 60 dias? Se já teve, a visita que está entrando
 # tende a ser a mesma história de novo -- e quem vai a campo merece saber
 # disso antes de sair.
 #
@@ -2573,7 +2597,8 @@ def notificar_improdutiva_telegram(unidade, contrato, nome_cliente, bairro,
     if achado.get('os'):
         linhas.append(f"• OS anterior: {html.escape(str(achado['os']))}")
 
-    return enviar_alerta_telegram(f"<b>{chr(10).join(linhas)}</b>", parse_mode="HTML")
+    return enviar_alerta_telegram(f"<b>{chr(10).join(linhas)}</b>", parse_mode="HTML",
+                                  destino=regiao_da_unidade(unidade))
 
 
 def _data_agendamento(valor):
@@ -2638,7 +2663,7 @@ def acompanhar_remarcacao(chamado, os_id, unidade, agendamentos_vistos):
     if isinstance(nome_cliente, str):
         nome_cliente = nome_cliente.strip() or 'N/D'
 
-    # A janela de 30 dias conta a partir da data NOVA, não da abertura da
+    # A janela de 60 dias conta a partir da data NOVA, não da abertura da
     # O.S.: o que interessa é se houve improdutiva perto da visita que vão
     # fazer agora. Uma O.S. aberta há dois meses e remarcada para amanhã
     # continua valendo a conferida.
@@ -2727,7 +2752,7 @@ def montar_lista_improdutivas_abertas(lista_chamados):
         if isinstance(nome_cliente, str):
             nome_cliente = nome_cliente.strip() or 'N/D'
 
-        # A janela de 30 dias conta a partir do agendamento quando existe --
+        # A janela de 60 dias conta a partir do agendamento quando existe --
         # mesma escolha do aviso de remarcação: o que importa é se houve
         # improdutiva perto da visita que vão fazer, não perto da abertura.
         agendamento = chamado.get('agendamentoData')
@@ -3766,12 +3791,22 @@ _fila_whatsapp = deque(maxlen=TAMANHO_MAX_FILA_WHATSAPP)
 _fila_whatsapp_lock = threading.Lock()
 
 
-def _postar_alerta_whatsapp(mensagem):
-    """Envio cru, sem fila. Devolve True só se o grupo realmente recebeu."""
+def _postar_alerta_whatsapp(mensagem, destino=None):
+    """Envio cru, sem fila. Devolve True só se o grupo realmente recebeu.
+
+    Sem `destino` vai para o grupo principal, como sempre. Com destino, o
+    serviço Node resolve a região para o JID do grupo dela -- e recusa o envio
+    se não conhecer aquela região, em vez de cair no principal por engano.
+    Essa recusa é desejada: alerta do Rio no grupo do litoral é pior do que
+    alerta nenhum, porque quem roteia agiria sobre chamado que não é dele.
+    """
+    corpo = {"mensagem": mensagem}
+    if destino:
+        corpo["destino"] = destino
     try:
         resposta = _SESSAO_WHATSAPP.post(
             WHATSAPP_ALERTA_URL,
-            json={"mensagem": mensagem},
+            json=corpo,
             timeout=10,
         )
         if resposta.status_code != 200:
@@ -3788,7 +3823,7 @@ def _postar_alerta_whatsapp(mensagem):
         return False
 
 
-def enviar_alerta_whatsapp_grupo(mensagem, reenfileirar_se_falhar=False):
+def enviar_alerta_whatsapp_grupo(mensagem, reenfileirar_se_falhar=False, destino=None):
     """reenfileirar_se_falhar só é ligado no caminho de broadcast
     (enviar_alerta_telegram), por onde passam os alertas de CAPEX/garantia --
     informação que não se repete. As respostas diretas de comando ("recebi o
@@ -3797,13 +3832,17 @@ def enviar_alerta_whatsapp_grupo(mensagem, reenfileirar_se_falhar=False):
     if not WHATSAPP_ALERTA_ATIVO:
         return False
 
-    if _postar_alerta_whatsapp(mensagem):
+    if _postar_alerta_whatsapp(mensagem, destino):
         return True
 
     if reenfileirar_se_falhar:
         with _fila_whatsapp_lock:
             lotada = len(_fila_whatsapp) == TAMANHO_MAX_FILA_WHATSAPP
-            _fila_whatsapp.append((time.time(), mensagem))
+            # O destino vai junto na fila. Sem ele, um alerta regional que
+            # falhasse e fosse reenviado depois chegaria no grupo principal --
+            # a mensagem certa no grupo errado, e ninguém notaria porque ela
+            # de fato chegou em algum lugar.
+            _fila_whatsapp.append((time.time(), mensagem, destino))
             pendentes = len(_fila_whatsapp)
         if lotada:
             logger.warning(
@@ -3837,11 +3876,11 @@ def thread_reenvio_alertas_whatsapp():
 
         enviados = 0
         nao_enviados = []
-        for quando, mensagem in pendentes:
+        for quando, mensagem, destino in pendentes:
             # Assim que um falha, para de tentar os outros nesta rodada: o
             # serviço continua fora e insistir só enche o log.
-            if nao_enviados or not _postar_alerta_whatsapp(mensagem):
-                nao_enviados.append((quando, mensagem))
+            if nao_enviados or not _postar_alerta_whatsapp(mensagem, destino):
+                nao_enviados.append((quando, mensagem, destino))
                 continue
             enviados += 1
             time.sleep(1)   # não despejar tudo de uma vez no serviço
@@ -4151,12 +4190,13 @@ def iniciar_servico_alerta_whatsapp():
     logger.info(f"Serviço de alerta WhatsApp iniciado (PID {processo.pid}).")
 
 
-def enviar_alerta_telegram(mensagem, parse_mode=None):
+def enviar_alerta_telegram(mensagem, parse_mode=None, destino=None):
     mensagem_whatsapp = _converter_mensagem_para_whatsapp(mensagem, parse_mode)
     # Caminho dos alertas de CAPEX/garantia: se o grupo não receber agora, a
     # mensagem entra na fila de reenvio -- a O.S. já vai ficar marcada como
     # notificada pelo Telegram e ninguém reprocessaria esse envio.
-    enviar_alerta_whatsapp_grupo(mensagem_whatsapp, reenfileirar_se_falhar=True)
+    enviar_alerta_whatsapp_grupo(mensagem_whatsapp, reenfileirar_se_falhar=True,
+                                 destino=destino)
 
     if len(mensagem) > TELEGRAM_MAX_CARACTERES:
         sufixo = "\n\n[...mensagem truncada por exceder o limite do Telegram...]"

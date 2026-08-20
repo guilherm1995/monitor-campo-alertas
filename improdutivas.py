@@ -1,7 +1,7 @@
-# ============ IMPRODUTIVAS: base de 30 dias, consultada por entrante ============
+# ============ IMPRODUTIVAS: base de 60 dias, consultada por entrante ============
 #
 # O que este módulo faz: dado um entrante (contrato + nome do cliente), dizer
-# se aquele cliente JÁ TEVE uma improdutiva TÉCNICA nos últimos 30 dias.
+# se aquele cliente JÁ TEVE uma improdutiva TÉCNICA nos últimos 60 dias.
 #
 # O que ele deixou de fazer: até 13/08/2026 isto aqui era o /improdutivas --
 # um relatório de lote, disparado à mão no grupo do WhatsApp com um CSV
@@ -24,7 +24,11 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Janela da regra. Vale para as duas chaves (contrato e nome).
-DIAS_JANELA = 30
+#
+# Foi 30 até 20/08/2026. A janela NÃO se alarga sozinha: ela só enxerga o
+# que estiver dentro do arquivo exportado. Subir isto para 60 sem exportar
+# 60 dias não muda nada -- e não dá erro nenhum, o que é a parte ruim.
+DIAS_JANELA = 60
 
 # ---- Mesmo dicionário do operacional.py (visão Efetividade) ----
 MOTIVO_PRODUTIVO = {
@@ -197,7 +201,7 @@ def deve_alertar(motivo):
 
 
 # --------------------------------------------------------------------------
-# base de 30 dias
+# base de 60 dias
 # --------------------------------------------------------------------------
 def _encontrar_coluna(df, possibilidades):
     for p in possibilidades:
