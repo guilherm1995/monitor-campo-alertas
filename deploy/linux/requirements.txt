@@ -4,7 +4,7 @@
 # de memoria -- ver o historico da migracao para o comando exato usado.
 #
 # Bot (campo_bot_telegram): requests, psutil, pandas, Pillow, playwright
-# Site (auto relaótio):   pandas, openpyxl, playwright, fastapi, uvicorn,
+# Site (painel-operacional):   pandas, openpyxl, playwright, fastapi, uvicorn,
 #                         jinja2, python-multipart, itsdangerous, requests,
 #                         lxml, gspread, oauth2client
 # (pandas/openpyxl/playwright/requests aparecem nos dois -- listados uma vez)

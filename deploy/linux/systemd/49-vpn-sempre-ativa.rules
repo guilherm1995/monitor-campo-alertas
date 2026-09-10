@@ -1,0 +1,12 @@
+// Deixa o usuario operador ligar/desligar SO o vpn-sempre-ativa.service
+// sem pedir senha -- e o que faz o botao de VPN funcionar com um clique.
+// Qualquer outro servico continua exigindo autenticacao normal.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "operador") {
+        var unit = action.lookup("unit");
+        if (unit == "vpn-sempre-ativa.service") {
+            return polkit.Result.YES;
+        }
+    }
+});

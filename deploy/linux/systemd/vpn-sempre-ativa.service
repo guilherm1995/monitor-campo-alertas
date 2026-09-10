@@ -1,0 +1,35 @@
+[Unit]
+# VPN sempre-ativa nesta MAQUINA DE TRABALHO (Fedora), nao no servidor.
+# Sobe o openconnect (FortiGate), autentica pelo vpn_config.json e reconecta
+# sozinho. Mesmo script da producao (migracao_linux/bot/vpn_sempre_ativa.py),
+# so que aqui roda pelo python3 do sistema -- nao ha venv nesta maquina, e o
+# 'requests' ja esta instalado global.
+#
+# ATENCAO: o protocolo fortinet e TUNEL-CHEIO. Enquanto este servico estiver
+# ativo, TODA a internet desta maquina passa pela rede da Provedor. Pare o
+# servico (systemctl stop) para voltar a navegar direto.
+#
+# A conta 'usuario.vpn' e a MESMA usada pelo servidor de producao (campo-vpn).
+# As duas sessoes ja coexistiram sem derrubar uma a outra, mas se o FortiGate
+# passar a recusar sessao dupla, uma das duas cai.
+Description=VPN sempre-ativa (OpenConnect/FortiGate) nesta maquina
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/operador/Documentos/migracao_linux/bot
+ExecStart=/usr/bin/python3 /home/operador/Documentos/migracao_linux/bot/vpn_sempre_ativa.py
+
+# openconnect cria interface tun e mexe em rota -> precisa de root.
+User=root
+
+# O script tem backoff proprio (5s -> 120s) para reconectar a VPN. Este
+# Restart cobre so o caso do processo python morrer de vez.
+Restart=always
+RestartSec=5
+
+SyslogIdentifier=vpn-sempre-ativa
+
+[Install]
+WantedBy=multi-user.target

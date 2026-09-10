@@ -1,0 +1,66 @@
+#!/bin/sh
+# Liga/desliga a VPN sempre-ativa (vpn-sempre-ativa.service) sem decorar
+# comando de systemd. Uso:
+#
+#   vpn on       -> conecta agora
+#   vpn off      -> desconecta agora (volta a navegar direto)
+#   vpn          -> mostra o estado (e o IP do tunel, se conectado)
+#   vpn status   -> idem, com o log recente
+#   vpn log      -> acompanha o log ao vivo (Ctrl+C sai)
+#   vpn boot on  -> volta a subir sozinha no boot
+#   vpn boot off -> nao sobe mais no boot (o 'vpn on' manual continua valendo)
+#
+# Lembrete: o protocolo fortinet e tunel-cheio -- com a VPN ligada, TODA a
+# internet desta maquina passa pela rede da Provedor.
+
+UNIT=vpn-sempre-ativa.service
+IP_FILE=/home/operador/Documentos/migracao_linux/bot/vpn_ip_atual.txt
+
+estado() {
+    if systemctl is-active --quiet "$UNIT"; then
+        printf 'VPN: LIGADA'
+        if ip -4 addr show tun0 >/dev/null 2>&1; then
+            printf ' (tun0 %s)' "$(ip -4 -o addr show tun0 | awk '{print $4}' | cut -d/ -f1)"
+        elif [ -r "$IP_FILE" ]; then
+            printf ' (ultimo IP: %s)' "$(cat "$IP_FILE")"
+        fi
+        printf '\n'
+    else
+        echo 'VPN: desligada'
+    fi
+    if systemctl is-enabled --quiet "$UNIT"; then
+        echo 'Boot: sobe sozinha'
+    else
+        echo 'Boot: NAO sobe sozinha (so com "vpn on")'
+    fi
+}
+
+case "$1" in
+    on|start|ligar)
+        sudo systemctl start "$UNIT" && sleep 2 && estado
+        ;;
+    off|stop|desligar|parar)
+        sudo systemctl stop "$UNIT" && echo 'VPN desligada.'
+        ;;
+    restart|reconectar)
+        sudo systemctl restart "$UNIT" && sleep 2 && estado
+        ;;
+    log|logs)
+        exec journalctl -u "$UNIT" -f -o cat
+        ;;
+    status|"")
+        estado
+        [ "$1" = status ] && { echo; journalctl -u "$UNIT" -n 15 --no-pager -o cat; }
+        ;;
+    boot)
+        case "$2" in
+            on|enable)  sudo systemctl enable "$UNIT"  && echo 'Vai subir no boot.' ;;
+            off|disable) sudo systemctl disable "$UNIT" && echo 'Nao sobe mais no boot.' ;;
+            *) echo 'uso: vpn boot on | vpn boot off' ; exit 1 ;;
+        esac
+        ;;
+    *)
+        echo 'uso: vpn [on|off|restart|status|log|boot on|boot off]'
+        exit 1
+        ;;
+esac

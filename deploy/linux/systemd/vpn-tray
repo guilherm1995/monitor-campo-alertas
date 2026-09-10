@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Ícone da VPN Provedor na bandeja do sistema (KDE Plasma).
+
+- mostra o estado ao vivo (ligada / desligada / reconectando);
+- clique no ícone ou no menu para ligar/desligar (sem senha, pela regra polkit
+  49-vpn-sempre-ativa.rules);
+- AVISA por notificação quando o túnel cai e quando volta.
+
+Roda como processo de sessão (autostart em ~/.config/autostart). Usa PySide6,
+que já vem instalado nesta máquina.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import time
+
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QIcon, QAction
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
+
+UNIT = "vpn-sempre-ativa.service"
+IP_FILE = "/home/operador/Documentos/migracao_linux/bot/vpn_ip_atual.txt"
+INTERVALO_MS = 5000
+# segundos com o serviço ativo mas sem tun0 antes de gritar "caiu"
+SEGUNDOS_ATE_ALERTAR_QUEDA = 20
+
+ICONES = {
+    "ligada":       "network-vpn-symbolic",
+    "desligada":    "network-vpn-disconnected-symbolic",
+    "reconectando": "network-vpn-acquiring-symbolic",
+    "falha":        "network-vpn-no-route-symbolic",
+}
+
+
+def _run(*args: str) -> tuple[int, str]:
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        return p.returncode, (p.stdout or p.stderr).strip()
+    except Exception as e:                       # noqa: BLE001
+        return 1, str(e)
+
+
+def servico_ativo() -> bool:
+    return _run("systemctl", "is-active", "--quiet", UNIT)[0] == 0
+
+
+def servico_falhou() -> bool:
+    return _run("systemctl", "is-failed", "--quiet", UNIT)[0] == 0
+
+
+def tun_no_ar() -> str | None:
+    rc, out = _run("ip", "-4", "-o", "addr", "show", "tun0")
+    if rc != 0 or not out:
+        return None
+    # "3: tun0    inet 10.1.234.x/32 ..." -> pega o IP
+    for parte in out.split():
+        if "." in parte and "/" in parte:
+            return parte.split("/")[0]
+    return "?"
+
+
+def ip_salvo() -> str | None:
+    try:
+        with open(IP_FILE, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+class Bandeja:
+    def __init__(self, app: QApplication):
+        self.app = app
+        self.icone = QSystemTrayIcon()
+        self.icone.setToolTip("VPN Provedor")
+
+        menu = QMenu()
+        self.acao_toggle = QAction("Ligar/Desligar", menu)
+        self.acao_toggle.triggered.connect(self.alternar)
+        menu.addAction(self.acao_toggle)
+
+        acao_log = QAction("Ver log ao vivo", menu)
+        acao_log.triggered.connect(lambda: subprocess.Popen(
+            ["konsole", "-e", "journalctl", "-u", UNIT, "-f", "-o", "cat"]))
+        menu.addAction(acao_log)
+
+        menu.addSeparator()
+        acao_sair = QAction("Fechar este ícone", menu)
+        acao_sair.triggered.connect(self.app.quit)
+        menu.addAction(acao_sair)
+
+        self.icone.setContextMenu(menu)
+        self.icone.activated.connect(self._clique)
+        self.icone.show()
+
+        # estado anterior para detectar transições
+        self._estava_ligada: bool | None = None
+        self._sem_tun_desde: float | None = None
+        self._alertou_queda = False
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.atualizar)
+        self.timer.start(INTERVALO_MS)
+        self.atualizar()
+
+    # ---------- ações ----------
+    def _clique(self, motivo):
+        # Trigger = clique esquerdo no ícone
+        if motivo == QSystemTrayIcon.ActivationReason.Trigger:
+            self.alternar()
+
+    def alternar(self):
+        if servico_ativo():
+            _run("systemctl", "stop", UNIT)
+        else:
+            _run("systemctl", "start", UNIT)
+        QTimer.singleShot(1500, self.atualizar)
+
+    def _notifica(self, titulo, corpo, icone, urgencia="normal"):
+        if shutil.which("notify-send"):
+            subprocess.Popen([
+                "notify-send", "-a", "VPN Provedor", "-u", urgencia,
+                "-i", icone,
+                "-h", "string:x-canonical-private-synchronous:vpn-tray",
+                titulo, corpo,
+            ])
+
+    # ---------- laço ----------
+    def atualizar(self):
+        ativa = servico_ativo()
+        falhou = servico_falhou()
+        ip_tun = tun_no_ar() if ativa else None
+        agora = time.monotonic()
+
+        if not ativa:
+            estado = "falha" if falhou else "desligada"
+            dica = "VPN Provedor — falhou (veja o log)" if falhou else "VPN Provedor — desligada"
+            self._sem_tun_desde = None
+            self._alertou_queda = False
+        elif ip_tun:
+            estado = "ligada"
+            dica = f"VPN Provedor — ligada · {ip_tun}"
+            self._sem_tun_desde = None
+            self._alertou_queda = False
+        else:
+            estado = "reconectando"
+            dica = "VPN Provedor — reconectando…"
+            if self._sem_tun_desde is None:
+                self._sem_tun_desde = agora
+
+        self.icone.setIcon(QIcon.fromTheme(ICONES[estado]))
+        self.icone.setToolTip(dica)
+        self.acao_toggle.setText("Desligar a VPN" if ativa else "Ligar a VPN")
+
+        # ---- transições que geram aviso ----
+        ligada_agora = ativa and bool(ip_tun)
+
+        if self._estava_ligada is None:
+            pass  # primeira leitura, não avisa nada
+        elif self._estava_ligada and not ligada_agora:
+            if ativa:
+                # túnel caiu mas o wrapper ainda está tentando: espera um pouco
+                # antes de gritar, senão toda reconexão rotineira vira alarme
+                if (self._sem_tun_desde and not self._alertou_queda
+                        and agora - self._sem_tun_desde >= SEGUNDOS_ATE_ALERTAR_QUEDA):
+                    self._alertou_queda = True
+                    self._notifica("VPN caiu", "O túnel parou de responder. "
+                                   "Tentando reconectar sozinho…",
+                                   ICONES["reconectando"], "critical")
+            else:
+                self._notifica("VPN desligada",
+                               "A internet voltou a sair direto." if not falhou
+                               else "O serviço falhou — veja: vpn log",
+                               ICONES["falha" if falhou else "desligada"],
+                               "critical" if falhou else "normal")
+        elif not self._estava_ligada and ligada_agora:
+            self._notifica("VPN reconectada", f"IP no túnel: {ip_tun}",
+                           ICONES["ligada"])
+
+        self._estava_ligada = ligada_agora
+
+
+def main():
+    app = QApplication([])
+    app.setQuitOnLastWindowClosed(False)
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        # sem bandeja disponível: sai em silêncio em vez de travar a sessão
+        return
+    Bandeja(app)
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()
