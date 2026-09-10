@@ -23,6 +23,11 @@ COR_AMARELO = "#F5B942"    # bucket atenção (até 7 dias)
 COR_AMARELO_BG = "#3A3212"
 COR_VERMELHO = "#FF4D6A"   # bucket crítico (acima de 7 dias, vencida)
 COR_VERMELHO_BG = "#3A1220"
+# Conveniência tem cor própria, e de propósito NÃO é uma das três do semáforo:
+# não é boa nem ruim, é uma classificação à parte. Roxo separa a coluna do
+# resto sem sugerir gravidade nenhuma.
+COR_ROXO = "#B57BFF"
+COR_ROXO_BG = "#2A1740"
 
 FONTE = "'Segoe UI', 'Inter', system-ui, -apple-system, sans-serif"
 FONTE_NUM = "'Consolas', 'SF Mono', 'Cascadia Code', monospace"
@@ -37,11 +42,13 @@ _SLUG_CATEGORIA = {
 }
 
 
-# Faixas do farol de conexão, medidas sobre a fatia de loss. Loss é o que
-# dói: contrato que o Autenticador vê desconectado é visita que tem grande chance de
-# voltar improdutiva.
-LOSS_ATENCAO = 25.0     # a partir daqui, amarelo
-LOSS_CRITICO = 50.0     # a partir daqui, vermelho
+# Faixas do farol de conexão, medidas sobre a fatia CONECTADA -- que é o que a
+# coluna anuncia. Perto de tudo conectado, verde; perto de tudo em loss,
+# vermelho; no meio do caminho, âmbar. As faixas são simétricas de propósito:
+# 30% conectado e 30% de loss são o mesmo desequilíbrio visto de dois lados, e
+# faixas tortas fariam a mesma tabela contar duas histórias.
+CONECT_BOM = 70.0       # daqui para cima, verde
+CONECT_RUIM = 30.0      # daqui para baixo, vermelho; entre os dois, âmbar
 
 
 def _fmt_pct(valor):
@@ -68,12 +75,16 @@ def _cel(valor, cor=None, extra="", texto=None):
 
 
 def _farol_conexao(conectados, loss):
-    """Cor do par conectado/loss, pela gravidade -- não pelo nome da coluna.
+    """Cor do par de porcentagens, proporcional à fatia conectada.
 
-    As duas células recebem a MESMA cor de propósito: elas são uma informação
-    só, lida de relance. "18,2% conectado" em vermelho diz a mesma coisa que
-    "81,8% de loss" em vermelho, e ver as duas concordando custa menos que
-    comparar dois números.
+    Quem sinaliza é a PORCENTAGEM; as contagens ficam neutras. Colorir a
+    contagem pelo nome da coluna acendia vermelho em "Loss" mesmo valendo 1
+    contrato em 500, e verde em "Conectado" valendo 8 em 40 -- a cor
+    contradizia o número que estava dentro dela.
+
+    As duas células do par recebem a MESMA cor de propósito: são uma
+    informação só, lida de relance. "20% conectado" e "80% de loss" dizem o
+    mesmo fato, e vê-las concordando custa menos que comparar dois números.
 
     Sem dado do Autenticador não há cor. 0 conectado e 0 loss não é uma base
     saudável: é uma base que ninguém conseguiu consultar, e pintar isso de
@@ -82,12 +93,12 @@ def _farol_conexao(conectados, loss):
     total = (conectados or 0) + (loss or 0)
     if not total:
         return None
-    pct_loss = 100.0 * (loss or 0) / total
-    if pct_loss >= LOSS_CRITICO:
-        return "vermelho"
-    if pct_loss >= LOSS_ATENCAO:
+    pct_conectado = 100.0 * (conectados or 0) / total
+    if pct_conectado >= CONECT_BOM:
+        return "verde"
+    if pct_conectado > CONECT_RUIM:
         return "amarelo"
-    return "verde"
+    return "vermelho"
 
 
 def _linha_tabela(unidade, linha_idade, linha_agenda, categoria, destaque=False):
@@ -108,7 +119,7 @@ def _linha_tabela(unidade, linha_idade, linha_agenda, categoria, destaque=False)
         + _cel(b3, "vermelho", "pct", texto=_fmt_pct(linha_idade['pct_bucket3']))
         + f'<td class="cel total-col">{linha_idade["total"]}</td>'
         + _cel(linha_idade['enviado_d0'])
-        + _cel(linha_idade['conveniencia'])
+        + _cel(linha_idade['conveniencia'], "roxo")
         + _cel(linha_idade['oportunidade_injecao'], "destaque-col")
     )
 
@@ -127,8 +138,8 @@ def _linha_tabela(unidade, linha_idade, linha_agenda, categoria, destaque=False)
         conectados, loss = linha_idade['conectados'], linha_idade['loss']
         farol = _farol_conexao(conectados, loss)
         celulas_autenticador = (
-            _cel(conectados, "verde")
-            + _cel(loss, "vermelho")
+            _cel(conectados)
+            + _cel(loss)
             # O que decide se pinta é HAVER dado do Autenticador, não o valor de
             # cada célula: com 0 conectado e 1 loss, olhar só o conectado
             # deixaria "0%" cinza ao lado de "100%" vermelho -- o par diria
@@ -193,8 +204,8 @@ def _tabela_regiao(nome_regiao, unidades_ordenadas, idade_regiao, agenda_regiao,
             <th>Enviado D0</th>
             <th>Conveniência</th>
             <th class="destaque-col">Oport. Injeção</th>
-            <th class="verde">Conectado</th><th class="vermelho">Loss</th>
-            <th class="verde pct">% Conect.</th><th class="vermelho pct">% Loss</th>
+            <th>Conectado</th><th>Loss</th>
+            <th class="pct">% Conect.</th><th class="pct">% Loss</th>
             <th class="sep-esq">D+1</th><th>D+2</th><th>D+3</th><th>&gt;D+3</th>
             <th class="sep-esq">Vencida</th><th>No prazo</th>
           </tr>
@@ -351,6 +362,7 @@ def _estilo_base():
   tr.linha td.verde {{ background: {COR_VERDE_BG}; color: {COR_VERDE}; }}
   tr.linha td.amarelo {{ background: {COR_AMARELO_BG}; color: {COR_AMARELO}; }}
   tr.linha td.vermelho {{ background: {COR_VERMELHO_BG}; color: {COR_VERMELHO}; }}
+  tr.linha td.roxo {{ background: {COR_ROXO_BG}; color: {COR_ROXO}; }}
   tr.linha td.total-col {{ background: {COR_DESTAQUE}22; color: {COR_DESTAQUE}; font-weight: 700; }}
   tr.linha td.destaque-col {{ background: {COR_DESTAQUE}22; color: {COR_DESTAQUE}; font-weight: 700; }}
   td.sep-esq {{ border-left: 2px solid {COR_LINHA}; }}

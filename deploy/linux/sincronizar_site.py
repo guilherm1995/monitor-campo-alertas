@@ -1,4 +1,4 @@
-"""Traz o site de 'auto relaótio' (a fonte) para migracao_linux/site (o porte).
+"""Traz o site de 'painel-operacional' (a fonte) para migracao_linux/site (o porte).
 
 A fonte do site e sempre a pasta de desenvolvimento; esta aqui e uma copia
 preparada para o Linux. Copiar na mao sempre esquece um arquivo, entao a
@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 AQUI = Path(__file__).resolve().parent
-FONTE = AQUI.parent / "auto relaótio"
+FONTE = AQUI.parent / "painel-operacional"
 DESTINO = AQUI / "site"
 
 # Chaves que pertencem ao servidor, nao a maquina de desenvolvimento. Se ja

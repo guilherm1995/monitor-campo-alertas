@@ -251,7 +251,21 @@ function resolverDestino(destino) {
       : { erro: 'grupoJid não configurado em config.json (rode --listar-grupos)' };
   }
   const pedido = String(destino).trim();
-  if (pedido.endsWith('@g.us')) return { jid: pedido };   // JID cru, para teste
+
+  // Qualquer JID cru passa: grupo (@g.us), conversa individual
+  // (@s.whatsapp.net) e o @lid, que e o identificador que o WhatsApp passou a
+  // usar no lugar do numero.
+  //
+  // A regra e "tem arroba, e JID" em vez de uma lista de sufixos, e isso vem
+  // de um erro do mesmo dia: em 31/08/2026 o @lid foi tratado na ENTRADA e
+  // esquecido na SAIDA. A pergunta chegava, a IA respondia, e o envio voltava
+  // 500 -- do lado de quem perguntou, o bot simplesmente nao respondia.
+  // Enumerar sufixos erra de novo no proximo formato que aparecer.
+  //
+  // O apelido de regiao continua sendo resolvido abaixo, e destino
+  // desconhecido continua sendo erro: nunca cair no grupo principal por
+  // engano e o ponto desta funcao.
+  if (pedido.includes('@')) return { jid: pedido };
 
   const jid = config.gruposRegiao[pedido];
   if (!jid) {
@@ -278,6 +292,7 @@ const RECONEXAO_DELAY_MAX_MS = 5 * 60 * 1000;
 // ---------- Fila de mensagens recebidas do grupo (para o Python fazer polling) ----------
 const FILA_MENSAGENS_MAX = 300; // limite de segurança pra não crescer indefinidamente se ninguém consumir
 const ESPERA_LONGA_MS = 25000; // long-polling: segura a resposta até chegar mensagem ou estourar esse tempo
+const COMANDO_IDADE_MAX_SEG = 600; // 10 min: acima disso a mensagem é histórico, não ordem
 let filaMensagens = []; // { participante, texto, timestamp }
 let resolversPendentes = []; // callbacks de requisições /mensagens esperando mensagem nova
 
@@ -287,10 +302,44 @@ function avisarNovaMensagem() {
   resolvers.forEach((resolver) => resolver());
 }
 
-function extrairTextoMensagem(msg) {
-  if (!msg) return '';
+// Idade da mensagem em segundos, pelo carimbo que o proprio WhatsApp poe nela.
+// Devolve null quando nao da para saber -- e nesse caso quem chama deixa passar,
+// porque recusar por falta de carimbo perderia mensagem boa.
+function idadeMensagemSeg(m) {
+  const bruto = m && m.messageTimestamp;
+  if (!bruto) return null;
+  const ts = typeof bruto === 'number'
+    ? bruto
+    : (typeof bruto.toNumber === 'function' ? bruto.toNumber() : Number(bruto));
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  return Math.max(0, Math.round(Date.now() / 1000 - ts));
+}
+
+function extrairTextoMensagem(msg, profundidade = 0) {
+  if (!msg || profundidade > 4) return '';
   if (msg.conversation) return msg.conversation;
   if (msg.extendedTextMessage && msg.extendedTextMessage.text) return msg.extendedTextMessage.text;
+
+  // O WhatsApp embrulha o texto quando o grupo tem mensagens temporarias
+  // ligadas, quando alguem manda em visualizacao unica, ou quando edita a
+  // mensagem. O conteudo real fica um nivel abaixo, e sem desembrulhar o
+  // comando chega aqui como string vazia e e descartado em silencio.
+  const embrulhos = [
+    msg.ephemeralMessage,
+    msg.viewOnceMessage,
+    msg.viewOnceMessageV2,
+    msg.viewOnceMessageV2Extension,
+    msg.documentWithCaptionMessage,
+    msg.editedMessage,
+    msg.protocolMessage && msg.protocolMessage.editedMessage,
+  ];
+  for (const embrulho of embrulhos) {
+    if (embrulho && embrulho.message) {
+      const texto = extrairTextoMensagem(embrulho.message, profundidade + 1);
+      if (texto) return texto;
+    }
+  }
+
   return '';
 }
 
@@ -345,7 +394,18 @@ async function iniciar() {
 
   // Escuta mensagens recebidas (só interessa o grupo configurado em config.json)
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    // O Baileys entrega mensagem em dois tipos, e por muito tempo este serviço
+    // só aceitava um deles:
+    //   'notify' -> chegou ao vivo, com a conexão de pé;
+    //   'append' -> o servidor está REPRODUZINDO o que ficou na fila enquanto
+    //               a conexão esteve fora. Mensagem real, do grupo certo, já
+    //               decifrada -- e era descartada aqui sem uma linha de log.
+    // Em 25/08/2026 a conexão caiu de hora em hora o dia inteiro e TODO comando
+    // digitado chegou por esse caminho. Nenhum foi executado, e do lado de fora
+    // parecia que a escuta tinha morrido. Pior: o Baileys agrupa o lote e
+    // carimba todos com o tipo do primeiro, então um 'notify' legítimo que caia
+    // no mesmo lote de um 'append' morria junto.
+    if (type !== 'notify' && type !== 'append') return;
     for (const m of messages) {
       try {
         if (!m.message) continue; // mensagens de sistema (ex: entrou/saiu do grupo) não têm conteúdo
@@ -360,7 +420,46 @@ async function iniciar() {
             .catch((e) => console.log('⚠️  Falha ao anotar grupo visto:', e.message));
         }
 
-        if (!config.grupoJid || m.key.remoteJid !== config.grupoJid) continue; // só o grupo configurado
+        // Conversa privada passa, e vem marcada. Quem decide se RESPONDE e
+        // o Python, por uma lista de JIDs liberados -- aqui nao se filtra
+        // quem pode, so se separa o que e privado do que e do grupo. Deixar
+        // a decisao num lugar so evita o caso em que os dois lados discordam
+        // e ninguem sabe qual esta valendo.
+        //
+        // "Privado e tudo que NAO e grupo", e nao "tudo que termina em
+        // @s.whatsapp.net". Testado em 31/08/2026: com o teste pelo sufixo,
+        // duas mensagens enviadas no privado nao chegaram -- o WhatsApp hoje
+        // entrega a conversa individual tambem como @lid, o identificador que
+        // ele passou a usar no lugar do numero. Listar sufixos conhecidos
+        // erraria de novo no proximo que inventarem; o que nao muda e que
+        // grupo termina em @g.us.
+        const de = String(m.key.remoteJid || '');
+        const ehGrupo = de.endsWith('@g.us');
+        const ehTransmissao = de.endsWith('@broadcast') || de === 'status@broadcast';
+        const ehPrivado = !ehGrupo && !ehTransmissao && de !== '';
+        if (ehPrivado) {
+          console.log(`💬 Mensagem privada de ${de}`);
+        }
+
+        // O grupo de comando continua sendo um so -- e onde /reiniciar,
+        // /desligar e o resto vivem. Os grupos de REGIAO passam a ser
+        // escutados tambem, mas so para o /bot: quem decide o que aceitar em
+        // cada um e o Python, e a lista de regiao sai do proprio config, sem
+        // um segundo lugar dizendo quais grupos existem.
+        const ehPrincipal = !!config.grupoJid && de === config.grupoJid;
+        const ehRegiao = Object.values(config.gruposRegiao || {}).includes(de);
+        if (!ehPrivado && !ehPrincipal && !ehRegiao) continue;
+
+        // A contrapartida de aceitar 'append': a fila reproduzida pode arrastar
+        // mensagem de horas ou dias atrás, e comando não é histórico -- é ordem.
+        // Executar um "desligar" de anteontem porque o WhatsApp resolveu
+        // ressincronizar seria pior do que perder o comando. Passada a janela,
+        // o comando vira registro: fica no log e não roda.
+        const idade = idadeMensagemSeg(m);
+        if (idade !== null && idade > COMANDO_IDADE_MAX_SEG) {
+          console.log(`⏳ Mensagem antiga ignorada (${idade}s de idade, limite ${COMANDO_IDADE_MAX_SEG}s).`);
+          continue;
+        }
 
         const participante = m.key.participant || m.key.remoteJid;
 
@@ -393,6 +492,9 @@ async function iniciar() {
               texto: '',
               arquivo: { nome: nomeOriginal, caminho: caminhoDestino },
               timestamp: Date.now(),
+              privado: ehPrivado,
+              principal: ehPrincipal,
+              conversa: m.key.remoteJid,
             });
             if (filaMensagens.length > FILA_MENSAGENS_MAX) {
               filaMensagens = filaMensagens.slice(-FILA_MENSAGENS_MAX);
@@ -408,7 +510,17 @@ async function iniciar() {
         const texto = extrairTextoMensagem(m.message).trim();
         if (!texto) continue; // ignora mídia sem legenda, figurinhas, etc.
 
-        filaMensagens.push({ participante, texto, timestamp: Date.now() });
+        // `conversa` e para onde a resposta volta: o grupo, ou o numero de
+        // quem falou no privado. Sem ele, o Python responderia sempre no
+        // grupo -- inclusive a pergunta que alguem fez reservadamente.
+        filaMensagens.push({
+          participante,
+          texto,
+          timestamp: Date.now(),
+          privado: ehPrivado,
+          principal: ehPrincipal,
+          conversa: m.key.remoteJid,
+        });
         if (filaMensagens.length > FILA_MENSAGENS_MAX) {
           filaMensagens = filaMensagens.slice(-FILA_MENSAGENS_MAX);
         }
@@ -608,6 +720,77 @@ const servidor = http.createServer((req, res) => {
           caption: legenda || '',
         });
         console.log(`🖼️  Imagem enviada (${destino || 'principal'}, ${bufferImagem.length} bytes)${legenda ? ` com legenda: "${String(legenda).slice(0, 60)}..."` : ''}`);
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ ok: false, erro: e.message }));
+      }
+    });
+  } else if (req.method === 'POST' && req.url === '/alerta-arquivo') {
+    // Envia um ARQUIVO (ex: o CSV cru da extração do OFS) como documento.
+    // Body esperado:
+    //   { "arquivoBase64": "<bytes em base64>",
+    //     "nome": "OFS 21-08 09h.csv",         // como aparece no grupo
+    //     "mimetype": "text/csv",              // opcional
+    //     "legenda": "texto opcional",
+    //     "destino": "chave ou JID" }
+    //
+    // Documento e imagem são caminhos separados de propósito: mandar CSV como
+    // imagem não existe, e mandar PNG como documento tira a pré-visualização
+    // que faz o painel ser lido no próprio grupo.
+    const LIMITE_CORPO_ARQUIVO_BYTES = 20 * 1024 * 1024;
+    let corpo = '';
+    let corpoGrandeDemais = false;
+    req.on('data', (chunk) => {
+      corpo += chunk;
+      if (corpo.length > LIMITE_CORPO_ARQUIVO_BYTES) {
+        corpoGrandeDemais = true;
+        req.destroy();
+      }
+    });
+    req.on('end', async () => {
+      if (corpoGrandeDemais) return;
+      res.setHeader('Content-Type', 'application/json');
+      try {
+        const { arquivoBase64, nome, mimetype, legenda, destino } = JSON.parse(corpo || '{}');
+
+        if (!arquivoBase64 || !String(arquivoBase64).trim()) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ ok: false, erro: 'campo "arquivoBase64" ausente ou vazio' }));
+        }
+        // Sem nome, o WhatsApp mostra o documento como "arquivo" e ninguém
+        // acha depois na busca do grupo -- que é justamente para isso que a
+        // extração vai para lá.
+        if (!nome || !String(nome).trim()) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ ok: false, erro: 'campo "nome" ausente ou vazio' }));
+        }
+        if (!conectado || !sockGlobal) {
+          res.writeHead(503);
+          return res.end(JSON.stringify({ ok: false, erro: 'WhatsApp ainda não conectado' }));
+        }
+        const alvo = resolverDestino(destino);
+        if (alvo.erro) {
+          res.writeHead(500);
+          return res.end(JSON.stringify({ ok: false, erro: alvo.erro }));
+        }
+
+        let bufferArquivo;
+        try {
+          bufferArquivo = Buffer.from(arquivoBase64, 'base64');
+        } catch (e) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ ok: false, erro: 'arquivoBase64 inválido (falha ao decodificar)' }));
+        }
+
+        await sockGlobal.sendMessage(alvo.jid, {
+          document: bufferArquivo,
+          fileName: String(nome),
+          mimetype: mimetype || 'application/octet-stream',
+          caption: legenda || '',
+        });
+        console.log(`📎 Arquivo enviado (${destino || 'principal'}, ${String(nome)}, ${bufferArquivo.length} bytes)`);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
       } catch (e) {

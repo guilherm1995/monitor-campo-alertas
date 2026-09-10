@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=VPN Sumicity (liga/desliga)
+Comment=Alterna a VPN sempre-ativa com um clique
+Icon=network-vpn-symbolic
+Exec=/home/guilherme/.local/bin/vpn-toggle
+Terminal=false
+Categories=Network;
+Keywords=vpn;openconnect;sumicity;fortinet;
+StartupNotify=false

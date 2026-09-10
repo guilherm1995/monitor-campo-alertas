@@ -27,6 +27,7 @@ import garantias_render
 from backlog_envio import (
     WHATSAPP_ALERTA_URL,
     WHATSAPP_ALERTA_IMAGEM_URL,
+    WHATSAPP_ALERTA_ARQUIVO_URL,
     WHATSAPP_ALERTA_ATIVO,
     consultar_autenticador_status,
 )
@@ -105,6 +106,28 @@ def enviar_texto(mensagem, destino):
         WHATSAPP_ALERTA_URL,
         {'mensagem': mensagem, 'destino': destino},
         f"texto de garantias ({destino})",
+    )
+
+
+def enviar_arquivo(caminho, nome, legenda, destino, mimetype='application/octet-stream'):
+    """Manda um arquivo como DOCUMENTO no grupo (ex: o CSV cru do OFS).
+
+    `nome` é como o arquivo aparece na conversa -- e é por ele que alguém acha
+    a extração de uma hora específica na busca do grupo meses depois. Nome
+    genérico ("arquivo.csv" repetido 14 vezes por dia) torna o histórico
+    inútil, então o chamador manda data e hora dentro do nome.
+    """
+    try:
+        with open(caminho, 'rb') as arquivo:
+            conteudo_base64 = base64.b64encode(arquivo.read()).decode('ascii')
+    except Exception:
+        logger.exception("Não consegui ler o arquivo %s.", caminho)
+        return False
+    return _postar(
+        WHATSAPP_ALERTA_ARQUIVO_URL,
+        {'arquivoBase64': conteudo_base64, 'nome': nome, 'mimetype': mimetype,
+         'legenda': legenda or '', 'destino': destino},
+        f"arquivo {nome} ({destino})",
     )
 
 

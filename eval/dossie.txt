@@ -1,0 +1,181 @@
+RETRATO DA OPERAÇÃO -- 31/07/2026 09:00 (CONGELADO PARA AVALIAÇÃO)
+
+Este é um dossiê de mentira, escrito à mão, com números escolhidos para as
+perguntas do avaliar_assistente.py. Ele não descreve nenhum dia real da
+operação e não deve ser lido como tal. Existe para que a mesma pergunta receba
+sempre o mesmo retrato: contra dados vivos, a resposta certa de hoje seria a
+errada de amanhã, e o avaliador não mediria nada.
+
+# VOCABULÁRIO DA OPERAÇÃO
+
+Use estes termos exatamente com estes sentidos. Quem pergunta no grupo usa as
+palavras daqui, não as do manual.
+
+## O que é uma O.S.
+
+**O.S.** -- ordem de serviço. A unidade de trabalho: uma visita a fazer.
+
+**Nota**, ou **nota de serviço** -- é o mesmo que O.S. É como a operação chama
+no dia a dia. "Quantas notas o técnico tem hoje" quer dizer quantas O.S.
+Sem isto escrito, uma pergunta com "nota" recebia a resposta de que não havia
+notas, quando havia todas.
+
+**Chamado** -- o registro no CAMPO. Um chamado pode conter mais de uma O.S.
+Contar chamados e contar O.S. dá números diferentes, e a pergunta quase sempre
+é sobre O.S.
+
+**Atividade** -- como o OFS chama a mesma coisa do lado do campo. Uma
+atividade é uma tentativa: o mesmo serviço que voltou três vezes aparece como
+três atividades. Contar linhas do OFS não conta serviços distintos.
+
+**Contrato** -- o cliente, do ponto de vista do sistema. É a chave que liga
+CAMPO, OFS e Autenticador. Um contrato tem histórico; uma O.S., não.
+
+## Estados de agendamento
+
+**D0** -- agendado para hoje. **D+1**, **D+2**, **D+3** -- para os próximos
+dias.
+
+**Vencida**, ou **atrasada** -- a data agendada já passou e a O.S. continua
+aberta.
+
+**Sem agenda** -- a O.S. existe e ninguém marcou dia. Não é o mesmo que
+vencida, e confundir as duas foi um erro real: uma O.S. sem agenda nunca
+esteve atrasada, porque nunca teve prazo.
+
+**Enviado D0** -- a O.S. está na agenda de hoje, seja pelo agendamento do
+próprio CAMPO, seja porque o contrato aparece no OFS GERAL de hoje. A segunda
+metade não é detalhe: O.S. que deu erro de integração é puxada à mão pelo
+OFS, e sem esse cruzamento o número sai menor que o real.
+
+**Conveniência** -- não é D0, mas o contrato está na planilha de conveniência.
+
+**Oportunidade de injeção** -- nem D0 nem conveniência. É o que dá para puxar
+para frente: agendamento futuro, vencida, e O.S. ainda sem agenda. É a
+resposta para "o que dá para adiantar".
+
+## Idade
+
+**Bucket de idade**, ou **balde** -- há quanto tempo a O.S. está aberta,
+contado da abertura. São três faixas, e **os limites mudam conforme a
+categoria** -- ver `03-categorias-e-prazos.md`. Um reparo com 3 dias e uma
+ativação com 3 dias não estão no mesmo balde.
+
+**Véspera de balde** -- a O.S. que muda de faixa amanhã. Serve para priorizar
+hoje o que piora amanhã.
+
+## Resultado da visita
+
+**Produtiva** -- a visita resolveu.
+
+**Improdutiva** -- a visita não resolveu. Interessa a improdutiva de origem
+**técnica**; as de origem comercial ou do cliente contam para outra conta.
+
+**Improdutiva reincidente** -- O.S. aberta cujo contrato já teve visita
+improdutiva antes, dentro da janela da base. É o sinal de que mandar o
+técnico de novo do mesmo jeito tende a dar no mesmo.
+
+**Garantia** -- reparo que voltou dentro do prazo de garantia do atendimento
+anterior. Na tela e nos rótulos aparece como **IRR**, **IFI** e
+**IFI de MDE**, que são os mesmos nomes usados no site, de propósito.
+
+## Coisas do campo
+
+**Unidade**, ou **praça** -- a sigla da base: CGT, VRD, SST. Ver
+`02-unidades.md`.
+
+**Fila** -- o código que diz o tipo de serviço da O.S. (ES02, ES05, UP02...).
+É dele que sai a categoria.
+
+**Recurso** -- no OFS, quem executa. Quase sempre é um técnico, mas **nem
+sempre é pessoa**: CARAGUATATUBA é uma fila de praça, não um sujeito. Dizer
+"o técnico CARAGUATATUBA" é erro.
+
+**Pacote** -- a última O.S. do chamado já tem material definido. O.S. na
+agenda de hoje **sem pacote** é candidata a improdutiva, porque o técnico sai
+sem o que instalar.
+
+**Área de risco** -- endereço que cai dentro do mapa de risco da operação do
+Rio, ou que está na lista de ruas marcadas. Muda como se atende, não se se
+atende.
+
+**Entrante** -- O.S. que entrou hoje. O **termômetro** compara as entradas de
+hoje com a média histórica: serve para dizer se o backlog cresceu porque
+entrou muito ou porque saiu pouco.
+
+**Autenticador** -- diz se o contrato está online ou offline agora. Só faz sentido
+para reparo: um cliente que responde ao ping raramente precisa de visita.
+
+== FONTES DESTE RETRATO ==
+Backlog do CAMPO (CAPEX): SIM
+Backlog do CAMPO (reparo): SIM
+OFS GERAL, agenda de hoje por contrato: SIM
+OFS, exportação do dia: SIM
+Lista de garantias: SIM
+Improdutivas: SIM
+Área de risco: SIM
+Autenticador: NÃO VEIO
+Termômetro de entrantes: SIM
+Base histórica do OFS: SIM
+
+== SINAIS POR UNIDADE ==
+  CGT: total 54 | até 48h 12 | de 48h a 7 dias 33 | acima de 7 dias 9 | enviado D0 7 | conveniência 5 | oportunidade de injeção 7
+  SST: total 15 | até 48h 4 | de 48h a 7 dias 9 | acima de 7 dias 2 | enviado D0 3 | conveniência 1 | oportunidade de injeção 2
+  IBL: total 12 | até 48h 3 | de 48h a 7 dias 7 | acima de 7 dias 2 | enviado D0 2 | conveniência 0 | oportunidade de injeção 1
+  VRD: total 9 | até 48h 2 | de 48h a 7 dias 4 | acima de 7 dias 3 | enviado D0 1 | conveniência 2 | oportunidade de injeção 0
+  Média da operação: 22.5 O.S. abertas por unidade.
+
+== BACKLOG DE CAPEX ==
+  CGT: D0 6 | D+1 8 | D+2 4 | D+3 2 | além de D+3 5 | vencidas 3
+  SST: D0 3 | D+1 4 | D+2 2 | D+3 1 | além de D+3 0 | vencidas 1
+  IBL: D0 2 | D+1 3 | D+2 1 | D+3 0 | além de D+3 1 | vencidas 0
+  VRD: D0 1 | D+1 2 | D+2 0 | D+3 1 | além de D+3 2 | vencidas 2
+
+== BACKLOG DE REPARO ==
+  Reparo: 163 chamado(s) aberto(s).
+  Upgrade: 52 chamado(s) aberto(s).
+  Mudança de cômodo: 16 chamado(s) aberto(s).
+
+== TERMÔMETRO DE ENTRANTES CAPEX ==
+  Entradas de hoje: 12 em CGT, 4 em SST, 3 em IBL, 1 em VRD.
+  Média histórica geral: 5.9 por unidade.
+
+== GARANTIAS EM ABERTO ==
+  Total: 23 garantia(s) em aberto.
+  CGT 11 | SST 6 | IBL 4 | VRD 2
+
+== AUTENTICADOR ==
+  A consulta ao Autenticador NÃO VEIO neste retrato. Nada pode ser afirmado sobre
+  contrato online ou offline.
+
+== IMPRODUTIVAS ==
+  1342 improdutiva(s) na base, 782 que geram alerta.
+  Contratos reincidentes com O.S. aberta agora: 4.
+
+== ÁREA DE RISCO ==
+  2 O.S. abertas em endereço de área de risco, ambas em CGT.
+
+== OFS GERAL, AGENDA DE HOJE ==
+  116 contrato(s) na agenda de hoje segundo o OFS GERAL.
+
+== OFS, EXPORTAÇÃO DO DIA (agenda de campo) ==
+  331 atividades, 301 produtivas (Almoço e Consulta Médica fora).
+  Por cidade: CARAGUATATUBA 61 | SAO SEBASTIAO 43 | ILHABELA 42 | BARRA MANSA 29
+  Por status: concluído 154 | cancelado 131 | não concluído 29 | pendente 9 | suspenso 8
+
+== TABELA DAS O.S. EM ABERTO ==
+Uma linha por O.S. Campos, nesta ordem: O.S., contrato, unidade, categoria,
+dias em aberto, agendamento, bairro, pacote, marcas.
+O agendamento já vem classificado entre colchetes: HOJE, ATRASADA, MARCADA
+PARA O FUTURO ou SEM AGENDA. Use o rótulo da própria linha; não recalcule pela
+data nem aproveite o rótulo da linha vizinha.
+62960869 | 6056791 | SSTBO | Reparo | 1d | agenda: 2026-08-01 [MARCADA PARA O FUTURO, daqui a 1 dia(s)] | BOICUCANGA | sem pacote
+62960870 | 6884951 | CGT | Ativação | 6d | agenda: 2026-07-29 [ATRASADA, deveria ter sido feita há 2 dia(s)] | CENTRO | com pacote
+62960871 | 6886284 | CGT | Ativação | 3d | agenda: 2026-07-31 [HOJE] | MASSAGUACU | com pacote
+62960872 | 7001122 | VRD | Reparo | 9d | agenda: sem agenda | ATERRADO | sem pacote | reincidente
+62960873 | 7001123 | VRD | Reparo | 7d | agenda: sem agenda | RETIRO | sem pacote
+62960874 | 7001124 | IBL | Ativação | 2d | agenda: 2026-08-02 [MARCADA PARA O FUTURO, daqui a 2 dia(s)] | PEREQUE | com pacote
+
+== NOTIFICAÇÕES DO BOT ==
+  1785 O.S. já notificadas anteriormente.
+  92 reparos já confirmados como garantia.

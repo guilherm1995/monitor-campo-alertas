@@ -35,6 +35,20 @@ WHATSAPP_ALERTA_IMAGEM_URL = os.environ.get(
     'WHATSAPP_ALERTA_IMAGEM_URL',
     WHATSAPP_ALERTA_URL.replace('/alerta', '/alerta-imagem'),
 )
+WHATSAPP_ALERTA_ARQUIVO_URL = os.environ.get(
+    'WHATSAPP_ALERTA_ARQUIVO_URL',
+    WHATSAPP_ALERTA_URL.replace('/alerta', '/alerta-arquivo'),
+)
+
+# Para onde vai o backlog PEDIDO por alguém: o grupo de resultados, não o de
+# comandos. O grupo de comando é canal de ordem e de alerta -- despejar oito
+# tabelas nele afogava as duas coisas, e quem pediu só precisa saber que já
+# está saindo no outro lugar. O backlog AGENDADO não passa por aqui: continua
+# indo para onde sempre foi.
+DESTINO_RESULTADOS = os.environ.get(
+    'BACKLOG_DESTINO_RESULTADOS', '000000000000000000@g.us')
+NOME_DESTINO_RESULTADOS = os.environ.get(
+    'BACKLOG_NOME_DESTINO_RESULTADOS', 'Resultados Operacional')
 WHATSAPP_ALERTA_ATIVO = os.environ.get('WHATSAPP_ALERTA_ATIVO', '1') != '0'
 
 BACKLOG_INTERVALO_SEG = float(os.environ.get('BACKLOG_INTERVALO_SEG', str(2.5 * 60 * 60)))  # 2h30
@@ -155,15 +169,21 @@ def enviar_foto_telegram(caminho_imagem, legenda=None):
         logger.error(f"Falha ao enviar imagem: {e}")
         return False
 
-def enviar_imagem_whatsapp_grupo(caminho_imagem, legenda=None):
+def enviar_imagem_whatsapp_grupo(caminho_imagem, legenda=None, destino=None):
+    """Manda a imagem ao grupo. Sem `destino`, vai para o grupo principal --
+    que é como o backlog agendado sempre saiu. Com `destino` (um JID cru, que
+    a ponte aceita), vai para o grupo escolhido."""
     if not WHATSAPP_ALERTA_ATIVO:
         return False
     try:
         with open(caminho_imagem, "rb") as arquivo_imagem:
             imagem_base64 = base64.b64encode(arquivo_imagem.read()).decode("ascii")
+        corpo = {"imagemBase64": imagem_base64, "legenda": legenda or ""}
+        if destino:
+            corpo["destino"] = destino
         resposta = requests.post(
             WHATSAPP_ALERTA_IMAGEM_URL,
-            json={"imagemBase64": imagem_base64, "legenda": legenda or ""},
+            json=corpo,
             timeout=30,
         )
         if resposta.status_code != 200:
@@ -175,7 +195,8 @@ def enviar_imagem_whatsapp_grupo(caminho_imagem, legenda=None):
         return False
 
 # ---- Função principal de geração e envio ----
-def gerar_e_enviar_backlog_tipo(lista_chamados, tipo, conveniencias=None):
+def gerar_e_enviar_backlog_tipo(lista_chamados, tipo, conveniencias=None,
+                                destino_whatsapp=None):
     with _lock_envio:
         if not lista_chamados:
             logger.warning(f"gerar_e_enviar_backlog_tipo({tipo}): lista vazia.")
@@ -309,7 +330,8 @@ def gerar_e_enviar_backlog_tipo(lista_chamados, tipo, conveniencias=None):
         for (categoria, regiao), caminho in caminhos.items():
             legenda = f"{LEGENDAS_CATEGORIA.get(categoria, categoria)} — {regiao}"
             ok_tg = enviar_foto_telegram(caminho, legenda)
-            ok_wpp = enviar_imagem_whatsapp_grupo(caminho, legenda)
+            ok_wpp = enviar_imagem_whatsapp_grupo(caminho, legenda,
+                                                  destino=destino_whatsapp)
             if not (ok_tg or ok_wpp):
                 sucesso = False
                 logger.error(f"Falha no envio de {categoria} / {regiao}")

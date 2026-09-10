@@ -23,6 +23,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 import html
 import threading
+import functools
 import queue
 import subprocess
 import ctypes
@@ -58,10 +59,28 @@ if os.path.isdir(_RAIZ):
 from amostra_chamados import salvar_amostra_chamados, salvar_diagnostico_plano
 
 # ============ MODIFICADO: importar também a nova função ============
-from backlog_envio import gerar_e_enviar_backlog, gerar_e_enviar_backlog_tipo, configurar_telegram
+from backlog_envio import (gerar_e_enviar_backlog, gerar_e_enviar_backlog_tipo,
+                           configurar_telegram,
+                           DESTINO_RESULTADOS as BACKLOG_DESTINO,
+                           NOME_DESTINO_RESULTADOS as BACKLOG_NOME_DESTINO)
+import alertas_opcionais
 import garantias_envio
 import garantias_lista
+import painel_resultados
+import ofs_base_historica
 import improdutivas
+import area_risco
+import assistente_ia
+import busca_operacao
+import dossie_operacao
+from backlog_capex import calcular_backlog_capex
+from backlog_reparo import (calcular_backlog_reparo,
+                            coletar_contratos_reparo_abertos)
+from backlog_ofs import carregar_contratos_ofs_do_dia, localizar_ofs_geral
+from backlog_conveniencia import carregar_conveniencias
+from backlog_envio import consultar_autenticador_status
+import ofs_extracao
+from ofs_extracao import ARQUIVO_CSV as ARQUIVO_OFS_DO_DIA
 
 try:
     import win32gui, win32con
@@ -118,8 +137,18 @@ except ImportError:
     PANDAS_DISPONIVEL = False
 
 # ================= CONFIGURAÇÕES =================
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', 'SEU_TOKEN_DO_BOT_TELEGRAM')
-CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1000000000000')
+# Token e grupo do Telegram vêm SÓ do ambiente -- esta árvore é espelhada em
+# repositório público. No servidor moram num drop-in do systemd
+# (campo-bot.service.d/telegram.conf, modo 640 root). Sem eles o bot sobe normal,
+# mas os alertas do grupo saem só pelo WhatsApp; enviar_alerta_telegram()
+# tolera token vazio (loga e segue). `logger` ainda não existe aqui (é criado
+# lá embaixo), por isso o aviso vai por stderr, que o journal do serviço pega.
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
+CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    print("[campo-bot] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID ausentes no ambiente -- "
+          "alertas do Telegram desligados (WhatsApp segue). No servidor: "
+          "/etc/systemd/system/campo-bot.service.d/telegram.conf", file=sys.stderr)
 configurar_telegram(TELEGRAM_TOKEN, CHAT_ID)
 
 # Serviço standalone (Node/Baileys) responsável por enviar os alertas para o
@@ -172,14 +201,39 @@ CODIGOS_ALVO = [
     'ES04'
 ]
 
+# As filas do CAMPO que são REPARO, e portanto podem valer garantia.
+#
+# São duas porque o CAMPO separa o reparo do cliente PME em uma fila própria:
+# ES05 é "REPARO" e REPPME é "REPARO - PME". O serviço é o mesmo, o cliente é
+# que é outro -- e a garantia não olha o porte do cliente, olha se existe
+# serviço nosso concluído no prazo para aquele contrato.
+#
+# Até 04/09/2026 só ES05 era avaliado. REPPME já vinha na busca (entrou junto
+# com ES06/UP02/ES15, para o backlog), mas caía no fim do `if/elif` sem
+# ninguém tratar: nem entrava no conjunto de reparos abertos, nem passava por
+# verificar_garantia_reparo. O resultado era do pior tipo, silencioso -- reparo
+# de PME sobre serviço nosso recente não alertava, e também não aparecia na
+# lista de garantias de hora em hora. Achado pela operação no contrato
+# 6911438: ativação em 03/09/2026, reparo no dia seguinte, nenhum alerta.
+#
+# Esta lista é do vocabulário do CAMPO. A da Base OFS é outra (lá o tipo é
+# "Ativação", "Reparo Corretivo" e "Mudança de Endereço", sem o sufixo PME), e
+# quem lê o tipo do serviço ANTERIOR é verificar_garantia_reparo, por trecho
+# do nome -- então nada precisa mudar do lado da base.
+CODIGOS_REPARO_CAMPO = ['ES05', 'REPPME']
+
 LITORAL_SP = ['CGT', 'BASE', 'SST', 'SSTBO', 'IBL', 'BERT', 'BERTN']
 
-BAIRROS_COM_RESTRICAO_DE_SIGLA = [
-    'BORACEIA', 'BALNEARIO MOGIANO', 'MORADA DA PRAIA', 'JUQUEHY', 'JUQUEHI',
-    'BARRA DO SAHY', 'BARRA DO SAHI', 'CAMBURI', 'CAMBURY', 'CAMBURIZINHO',
-    'BALEIA', 'PRAIA DA BALEIA', 'SITIO VELHO', 'VILA CARIOCA',
-    'NUCLEO VILA CARIOCA', 'MARESIAS', 'PAUBA', 'BOICUCANGA'
-]
+# Os bairros que atendemos sob as siglas BERT/BERTN. A lista mora no
+# carga_litoral.py porque a prévia da carga usa exatamente a mesma: uma
+# atividade que chega como Bertioga é nossa nos mesmos bairros, aqui e lá.
+#
+# Antes eram duas listas iguais em dois arquivos. Duas listas divergem na
+# primeira vez que um bairro entra numa e não na outra, e a divergência sai
+# calada dos dois lados: o monitoramento deixaria de alertar sobre um serviço
+# que a prévia manda técnico atender, ou o contrário.
+from carga_litoral import BAIRROS_DE_BERTIOGA_QUE_ATENDEMOS as \
+    BAIRROS_COM_RESTRICAO_DE_SIGLA
 
 UNIDADES_RESTRICAO_BAIRRO = {
     'BERT': BAIRROS_COM_RESTRICAO_DE_SIGLA,
@@ -214,6 +268,47 @@ AUTENTICADOR_URL_SAVE = "https://provedor.example/status.php?action=save"
 AUTENTICADOR_URL_PROCESSA = "https://provedor.example/processa.php?bg=1"
 AUTENTICADOR_URL_LER_CSV = "https://provedor.example/ler_csv.php"
 
+# Conversa do /bot em andamento, por chat. Guarda o histórico que volta do
+# assistente -- e o dossiê vive dentro dele, na primeira volta, então a réplica
+# não remonta nem reenvia o retrato inteiro.
+#
+# Fica só em memória de propósito: conversa que sobrevivesse a um reinício do
+# bot seria pior do que não ter conversa nenhuma -- a pessoa responderia a uma
+# pergunta que o bot não lembra mais de ter feito, sobre um retrato de horas
+# atrás.
+AGUARDANDO_RESPOSTA_BOT = {}
+AGUARDANDO_RESPOSTA_BOT_WHATSAPP = {}
+
+# Quem pode conversar com o /bot no PRIVADO, por JID do WhatsApp
+# ("operador@provedor.example"), separados por vírgula.
+#
+# A lista é fechada, e vazia por padrão: sem nome nenhum aqui, o bot ignora
+# qualquer conversa privada e nada muda. Não é excesso de zelo -- no privado o
+# assistente entrega nome, endereço, telefone e senha de Wi-Fi de cliente, e o
+# número do bot é um número de WhatsApp como outro qualquer: quem descobrir
+# pode escrever. No grupo existe a plateia da operação; no privado não existe
+# ninguém para estranhar.
+#
+# Só o número importa: a comparação ignora o sufixo, então tanto faz escrever
+# o JID inteiro ou só os dígitos.
+def _so_numero_jid(valor):
+    """Só os dígitos da parte de antes do @, seja qual for o sufixo.
+
+    O WhatsApp entrega a conversa individual ora como <numero>@s.whatsapp.net,
+    ora como <id>@lid -- o identificador que ele passou a usar no lugar do
+    número. Comparar por dígitos funciona nos dois, e é por isso que a lista
+    de liberados aceita tanto o JID inteiro quanto só o número.
+    """
+    return ''.join(c for c in str(valor or '').split('@')[0] if c.isdigit())
+
+
+BOT_PV_LIBERADOS = {
+    _so_numero_jid(parte)
+    for parte in os.environ.get('BOT_PV_LIBERADOS', '').split(',')
+    if _so_numero_jid(parte)
+}
+TIMEOUT_CONVERSA_BOT_SEG = 5 * 60
+
 AGUARDANDO_CONTRATO_AUTENTICADOR = {}
 TIMEOUT_AGUARDANDO_CONTRATO_AUTENTICADOR_SEG = 5 * 60
 
@@ -222,6 +317,12 @@ TIMEOUT_AGUARDANDO_CONTRATO_AUTENTICADOR_SEG = 5 * 60
 # mesmo tempo no mesmo grupo não se atrapalham (cada uma tem sua própria
 # "espera" independente, em vez de compartilhar o estado do chat inteiro).
 AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP = {}
+
+# Quem pediu /alertas e ainda vai responder qual região. Mesma forma do
+# /autenticador, e pela mesma razão: chaveado por PESSOA, não pelo grupo, para duas
+# pessoas escolhendo ao mesmo tempo não trocarem a resposta uma da outra.
+AGUARDANDO_REGIAO_ALERTAS = {}
+TIMEOUT_AGUARDANDO_REGIAO_ALERTAS_SEG = 3 * 60
 
 # O /improdutivas mudou de natureza duas vezes em 13/08/2026, e é bom saber
 # qual dos três ele é hoje:
@@ -267,9 +368,14 @@ LISTA_CHAMADOS_ATUAL = {"dados": None}
 # ninguém saberia dizer qual das duas estava errada. São duas strings curtas
 # por chamado -- a projeção existe para descartar `ordemServicos`, que é a
 # parte pesada, não para economizar bytes de texto.
+# enderecoLogradouro entrou em 28/08/2026, junto com lat/lng (montados em
+# projetar_para_cache), para o /risco poder responder pela lista em cache em
+# vez de buscar tudo de novo na API. Mesmo argumento de nomeCliente e
+# enderecoBairro: sao poucos bytes por chamado, e a projecao existe para
+# descartar `ordemServicos`, nao para economizar texto curto.
 CAMPOS_CACHE_BACKLOG = ("id", "fila", "enderecoUnidade", "codigoContrato",
                         "dataAbertura", "dataConclusao", "agendamentoData",
-                        "nomeCliente", "enderecoBairro")
+                        "nomeCliente", "enderecoBairro", "enderecoLogradouro")
 
 
 def projetar_para_cache(lista_chamados):
@@ -284,9 +390,16 @@ def projetar_para_cache(lista_chamados):
         if not isinstance(chamado, dict):
             continue
         ordens = chamado.get("ordemServicos") or []
-        pacote = ordens[-1].get("pacote") if ordens and isinstance(ordens[-1], dict) else None
+        ultima = ordens[-1] if ordens and isinstance(ordens[-1], dict) else {}
+        pacote = ultima.get("pacote")
         registro = {campo: chamado.get(campo) for campo in CAMPOS_CACHE_BACKLOG}
         registro["tem_pacote"] = bool(pacote and str(pacote).strip())
+        # A coordenada do endereco tambem mora dentro de `ordemServicos`, e e
+        # a unica coisa alem do pacote que precisa sobreviver a projecao: sem
+        # ela o /risco so conseguiria responder pela lista de ruas, que e a
+        # via fraca. Dois numeros por chamado.
+        registro["lat"] = ultima.get("lat")
+        registro["lng"] = ultima.get("lng")
         enxuta.append(registro)
     return enxuta
 
@@ -302,7 +415,57 @@ def obter_lista_chamados_atual():
 TIPOS_BACKLOG_VALIDOS = ["capex", "reparo", "upgrade", "mudanca_comodo"]
 
 
-def gerar_e_enviar_backlog_todos_tipos(lista_chamados):
+# Um backlog de cada vez, no processo inteiro.
+#
+# POR QUE ISTO EXISTE
+# -------------------
+# O backlog completo leva minutos: são quatro tipos, cada um abrindo um
+# Playwright para virar imagem. Nesse tempo o grupo não vê nada acontecer, e a
+# reação natural de quem pediu é pedir de novo -- ou outra pessoa pede, sem
+# saber que já tem um rodando.
+#
+# O `gerar_e_enviar_backlog_tipo` serializa internamente, então o segundo
+# pedido não corrompia nada: ele ficava na fila e, minutos depois, despejava a
+# MESMA leva de imagens no grupo de novo. Barulho, e a impressão de que o bot
+# está repetindo sozinho.
+#
+# A trava não enfileira: ela RECUSA e avisa. Quem pediu prefere saber que já
+# tem um vindo a receber o dobro dez minutos depois.
+_backlog_em_andamento = threading.Lock()
+
+AVISO_BACKLOG_EM_ANDAMENTO = (
+    "⏳ *Aguarde!* Um backlog já está sendo gerado nesse momento."
+)
+
+
+def backlog_em_andamento():
+    """Tem backlog rodando agora?
+
+    Só para PERGUNTAR, antes de responder a quem pediu. Quem vai gerar de
+    verdade usa o `gerar_e_enviar_backlog_travado`, que toma a trava -- olhar
+    aqui e disparar depois deixaria a fresta entre as duas coisas.
+    """
+    return _backlog_em_andamento.locked()
+
+
+def gerar_e_enviar_backlog_travado(alvo, *args, **kwargs):
+    """Roda `alvo` segurando a trava do backlog; desiste se já houver um.
+
+    É esta função que as threads chamam, e não a de gerar direto: a trava
+    precisa ser tomada DENTRO da thread que trabalha, senão duas pessoas que
+    pedem no mesmo segundo passam as duas pela conferência antes de qualquer
+    uma começar.
+    """
+    if not _backlog_em_andamento.acquire(blocking=False):
+        logger.info("Pedido de backlog recusado: já existe um em andamento.")
+        return False
+    try:
+        return alvo(*args, **kwargs)
+    finally:
+        _backlog_em_andamento.release()
+
+
+def gerar_e_enviar_backlog_todos_tipos(lista_chamados, destino_whatsapp=None):
     """Gera e envia o backlog de TODOS os tipos (capex, reparo, upgrade,
     mudanca_comodo), um de cada vez. Rodar em sequência (em vez de disparar
     uma thread por tipo) porque gerar_e_enviar_backlog_tipo já serializa
@@ -312,7 +475,8 @@ def gerar_e_enviar_backlog_todos_tipos(lista_chamados):
     algum_falhou = False
     for tipo in TIPOS_BACKLOG_VALIDOS:
         try:
-            ok = gerar_e_enviar_backlog_tipo(lista_chamados, tipo)
+            ok = gerar_e_enviar_backlog_tipo(lista_chamados, tipo,
+                                             destino_whatsapp=destino_whatsapp)
             if not ok:
                 algum_falhou = True
                 logger.warning(f"Backlog completo: falha ao gerar/enviar o tipo '{tipo}'.")
@@ -494,6 +658,13 @@ TAMANHO_PAGINA_BUSCA_DIRETA = 290
 # do CAMPO antes, não a nossa RAM.
 INTERVALO_VARREDURA_COMPLETA_SEG = 45
 
+# Quanto o /bot espera pela PRIMEIRA varredura antes de desistir do dossie.
+# Trinta segundos cobrem com folga o intervalo de 25s entre varreduras, e e
+# menos do que o modelo costuma levar para responder -- ou seja, na pratica
+# nao atrasa ninguem.
+ESPERA_PRIMEIRA_VARREDURA_SEG = float(
+    os.environ.get('BOT_ESPERA_PRIMEIRA_VARREDURA_SEG', '30'))
+
 # Sessão HTTP da varredura de chamados, fora do Playwright.
 #
 # Medido em bancada com a mesma carga (96 requisições, 28.800 chamados):
@@ -524,6 +695,18 @@ def _sincronizar_cookies_campo(contexto):
 # 03/08 o bot ficou ~5h varrendo "0 chamados" porque o erro fatal do browser
 # era registrado como se fosse falha de rede -- veja ContextoNavegadorMorto.
 MAX_CICLOS_VAZIOS_SEGUIDOS = 5
+
+# Quantos ciclos seguidos SEM conseguir capturar o token/URL da API antes de
+# reabrir o navegador do zero. O `relogar()` recarrega dashboard e chamados,
+# mas quem preenche o token é o listener do PUT `.../chamado`, que às vezes
+# não dispara depois do relogin -- e aí `buscar_chamados_via_api()` devolve
+# `tentou=False` para sempre, sem varredura nenhuma. A guarda de zumbi acima
+# não pega: ela mora dentro do `if tentou:`. Em 10/09/2026 isso deixou o grupo
+# 4h38 sem UMA notificação, só recuperado por reboot manual. Com o reload+clique
+# custando ~25-50s por volta, 10 ciclos dão ~5-8 min -- folga para um relogin
+# lento e curto o bastante para não perder a tarde. `break` cai no laço externo
+# de executar_monitoramento, que reabre o Chromium e rearma a captura do zero.
+MAX_CICLOS_SEM_TOKEN = 10
 
 # Erros do Playwright que NÃO são intermitência de rede: significam que o
 # contexto/navegador morreu. Repetir a requisição nunca resolve -- o único
@@ -1501,26 +1684,88 @@ def obter_entrantes_capex_hoje():
         return dict(ENTRANTES_CAPEX_HOJE['por_unidade'])
 
 
+def _peso_do_dia_do_historico(dia_iso):
+    """Quanto o dia vale em DIAS ÚTEIS. Devolve None se a chave do
+    histórico não for uma data (arquivo mexido à mão, por exemplo).
+
+    A tabela de pesos mora em termometro_render porque a imagem também
+    precisa dela (para ajustar a referência do dia); manter uma cópia aqui
+    daria duas verdades. O import é tardio de propósito: termometro_render
+    puxa backlog_render, que puxa o Playwright -- peso demais para o start
+    do bot, que na maior parte dos dias nem gera termômetro."""
+    from termometro_render import peso_do_dia
+
+    try:
+        data = datetime.strptime(dia_iso, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    return peso_do_dia(data)
+
+
 def calcular_media_historica_geral_entrantes_capex():
-    """Média histórica GERAL de entrantes de CAPEX: junta a contagem de
-    TODAS as unidades em TODOS os dias já persistidos no histórico
-    (excluindo hoje, que ainda está em andamento) e tira a média só dos
-    valores > 0 -- mesmo critério já usado antes pra "média do dia", só
-    que agora olhando o histórico inteiro em vez de só hoje.
+    """Média histórica de entrantes de CAPEX POR UNIDADE, em entrantes por
+    DIA ÚTIL: junta a contagem de TODAS as unidades em TODOS os dias já
+    persistidos no histórico (excluindo hoje, que ainda está em andamento)
+    e divide pela soma dos PESOS dos dias, contando só os valores > 0.
+
+    O peso é o que mudou em 27/08/2026. Antes todo dia valia 1, e como
+    sábado e domingo têm muito menos entrante, eles puxavam a média para
+    baixo: 5,5 com fim de semana contra 6,2 só com dia útil, ~11% de
+    diferença. Agora sábado vale 0,7 e domingo 0,3 de um dia útil (ver
+    PESO_DIA_UTIL em termometro_render.py), então a média responde
+    "quantos entrantes se espera numa unidade num dia útil cheio" -- e é
+    ela, multiplicada pelo peso do dia de hoje, que vira a referência da
+    imagem.
+
+    Continua ignorando os zeros: unidade sem nenhum entrante no dia não
+    entra nem em cima nem embaixo da divisão, senão as unidades pequenas
+    afundariam a média de todas as outras.
 
     Devolve None se ainda não existe nenhum dia no histórico (bot rodando
     há pouco tempo) -- nesse caso o chamador decide o que fazer (ex: cair
     de volta pra média do próprio dia, como bootstrap)."""
     historico = carregar_historico_entrantes_capex()
-    valores = [
-        quantidade
-        for por_unidade in historico.values()
-        for quantidade in por_unidade.values()
-        if quantidade and quantidade > 0
-    ]
-    if not valores:
+    numerador = 0.0
+    soma_pesos = 0.0
+    for dia_iso, por_unidade in historico.items():
+        peso = _peso_do_dia_do_historico(dia_iso)
+        if peso is None:
+            continue
+        for quantidade in por_unidade.values():
+            if quantidade and quantidade > 0:
+                numerador += quantidade
+                soma_pesos += peso
+    if not soma_pesos:
         return None
-    return sum(valores) / len(valores)
+    return numerador / soma_pesos
+
+
+def calcular_medias_historicas_por_cluster(regioes):
+    """Média histórica de entrantes de CAPEX POR CLUSTER (região inteira),
+    também em entrantes por DIA ÚTIL: soma o que entrou em todas as
+    unidades da região, em todos os dias do histórico, e divide pela soma
+    dos pesos dos dias.
+
+    Diferente da média por unidade, aqui o zero NÃO é ignorado: uma região
+    que passou o domingo sem nenhum chamado teve um domingo de zero, e isso
+    é informação de verdade sobre o cluster. (Dias em que ninguém em lugar
+    nenhum abriu chamado não chegam a ser gravados no histórico.)
+
+    Devolve {nome da região: média} -- com None na região que ainda não
+    tem histórico nenhum."""
+    historico = carregar_historico_entrantes_capex()
+    medias = {}
+    for nome_regiao, unidades in regioes.items():
+        numerador = 0.0
+        soma_pesos = 0.0
+        for dia_iso, por_unidade in historico.items():
+            peso = _peso_do_dia_do_historico(dia_iso)
+            if peso is None:
+                continue
+            numerador += sum(por_unidade.get(unidade, 0) for unidade in unidades)
+            soma_pesos += peso
+        medias[nome_regiao] = (numerador / soma_pesos) if soma_pesos else None
+    return medias
 
 
 def gerar_e_enviar_termometro_capex():
@@ -1530,9 +1775,11 @@ def gerar_e_enviar_termometro_capex():
     lógica de envio já usada pro backlog (enviar_foto_telegram /
     enviar_imagem_whatsapp_grupo, importadas de backlog_envio)."""
     from backlog_envio import enviar_foto_telegram, enviar_imagem_whatsapp_grupo
-    from termometro_render import gerar_imagem_termometro
+    from termometro_render import gerar_imagem_termometro, REGIOES_TERMOMETRO
 
     contagem = obter_entrantes_capex_hoje()
+
+    medias_por_cluster = calcular_medias_historicas_por_cluster(REGIOES_TERMOMETRO)
 
     media_geral = calcular_media_historica_geral_entrantes_capex()
     if media_geral is None:
@@ -1547,7 +1794,10 @@ def gerar_e_enviar_termometro_capex():
         )
 
     try:
-        caminho = gerar_imagem_termometro(contagem, media_geral, pasta_saida=PASTA_RELATORIOS)
+        caminho = gerar_imagem_termometro(
+            contagem, media_geral, pasta_saida=PASTA_RELATORIOS,
+            medias_por_cluster=medias_por_cluster,
+        )
     except Exception:
         logger.exception("Erro ao gerar a imagem do termômetro de entrantes CAPEX.")
         return False
@@ -1559,6 +1809,216 @@ def gerar_e_enviar_termometro_capex():
         logger.error("Falha ao enviar a imagem do termômetro de entrantes CAPEX.")
         return False
     return True
+
+
+def gerar_e_enviar_carga(quando=None, destino_whatsapp=None,
+                         telegram=True, whatsapp=True, rodape=None):
+    """A previa da carga do dia seguinte: capa e lista detalhada, em imagem.
+
+    Vai para onde o comando foi dado -- `destino_whatsapp` e o JID do grupo que
+    pediu. Sem ele, sai no grupo principal, que e como os relatorios agendados
+    sempre sairam.
+
+    A base e atualizada no OFS antes de contar. Prévia montada sobre um arquivo
+    de uma hora atras erra de um jeito especialmente ruim: ela sai plausivel, e
+    quem monta a rota nao tem como desconfiar do numero.
+    """
+    from backlog_envio import enviar_foto_telegram, enviar_imagem_whatsapp_grupo
+
+    import atualizar_bases
+    import carga_litoral
+    import carga_render
+
+    estado = atualizar_bases.garantir_ofs_fresco()
+    aviso = atualizar_bases.aviso_de_frescor(estado)
+
+    try:
+        carga = carga_litoral.levantar_carga(quando=quando)
+    except Exception:
+        logger.exception("Erro ao levantar a previa da carga.")
+        return False
+
+    if carga.get("aviso"):
+        recado = "⚠️ Não consegui montar a prévia: %s." % carga["aviso"]
+        if whatsapp:
+            enviar_alerta_whatsapp_grupo(recado, destino=destino_whatsapp)
+        if telegram:
+            enviar_alerta_telegram(recado)
+        return False
+
+    dia = carga["data"].strftime("%d/%m")
+    if not carga["total"]:
+        # Nenhuma atividade nao vira imagem: tabela sem linha e figura de nada,
+        # e o grupo merece a frase em vez do PNG vazio. Mesma regra da lista de
+        # garantias.
+        recado = ("📋 *Prévia da carga — %s*\nNenhuma atividade no Litoral "
+                  "Norte para esse dia." % dia)
+        if aviso:
+            recado += "\n" + aviso
+        if rodape:
+            recado += "\n\n" + rodape
+        if whatsapp:
+            enviar_alerta_whatsapp_grupo(recado, destino=destino_whatsapp)
+        if telegram:
+            enviar_alerta_telegram(recado)
+        return True
+
+    try:
+        capa, lista = carga_render.gerar_imagens_carga(
+            carga, pasta_saida=PASTA_RELATORIOS)
+    except Exception:
+        logger.exception("Erro ao gerar as imagens da previa da carga.")
+        return False
+
+    legenda_capa = ("📋 Prévia da carga — %s (%d O.S. no Litoral Norte)"
+                    % (dia, carga["total"]))
+    if aviso:
+        legenda_capa += "\n" + aviso
+    legenda_lista = "📋 Lista detalhada — %s" % dia
+    # O rodapé é a instrução de uso, e ela vai na ÚLTIMA imagem de propósito:
+    # na primeira, ela ficaria acima da tabela que a pessoa abriu para ler.
+    if rodape:
+        legenda_lista += "\n\n" + rodape
+
+    enviados = []
+    if whatsapp:
+        enviados.append(enviar_imagem_whatsapp_grupo(
+            capa, legenda_capa, destino=destino_whatsapp))
+        enviados.append(enviar_imagem_whatsapp_grupo(
+            lista, legenda_lista, destino=destino_whatsapp))
+    if telegram:
+        enviados.append(enviar_foto_telegram(capa, legenda_capa))
+        enviados.append(enviar_foto_telegram(lista, legenda_lista))
+
+    if not any(enviados):
+        logger.error("Falha ao enviar as imagens da previa da carga.")
+        return False
+    return True
+
+
+# A prévia sai sozinha no fim da tarde, no grupo do litoral.
+#
+# Os horários são regra da operação, não palpite: ver CARGA_AUTOMATICA_HORARIOS.
+#
+# O destino é o grupo do litoral porque a prévia é do litoral. Mandá-la no grupo
+# principal faria a operação do Rio ler todo dia uma tabela que não é dela.
+CARGA_AUTOMATICA_ATIVA = os.environ.get('CARGA_AUTOMATICA_ATIVA', '1') != '0'
+CARGA_AUTOMATICA_DESTINO = os.environ.get('CARGA_AUTOMATICA_DESTINO', 'litoral')
+
+# Os horários em que a prévia sai sozinha, em HH:MM separados por vírgula.
+#
+# São três, pedidos pela operação em 01/09/2026, e cada um pega um momento
+# diferente da montagem da rota: 15:40 é quando ela começa, 16:40 pega o que
+# entrou na última hora, e 18:30 é o retrato de fechamento do dia. A agenda de
+# amanhã enche ao longo da tarde -- uma prévia só, cedo, mostra menos do que o
+# dia vai ter.
+CARGA_AUTOMATICA_HORARIOS_TEXTO = os.environ.get(
+    'CARGA_AUTOMATICA_HORARIOS', '15:40,16:40,18:30')
+
+
+def _ler_horarios(texto):
+    """"HH:MM,HH:MM" -> [(15, 40), (16, 40), ...], em ordem e sem repetidos.
+
+    Horário escrito errado é IGNORADO com aviso no log, e não derruba os
+    outros: uma vírgula a mais na variável não pode calar a prévia inteira.
+    """
+    achados = []
+    for pedaco in str(texto or '').replace(';', ',').split(','):
+        pedaco = pedaco.strip()
+        if not pedaco:
+            continue
+        try:
+            hora, minuto = pedaco.split(':')
+            hora, minuto = int(hora), int(minuto)
+            if not (0 <= hora <= 23 and 0 <= minuto <= 59):
+                raise ValueError(pedaco)
+        except (ValueError, TypeError):
+            logger.warning("Horário inválido em CARGA_AUTOMATICA_HORARIOS: %r "
+                           "(ignorado).", pedaco)
+            continue
+        if (hora, minuto) not in achados:
+            achados.append((hora, minuto))
+    return sorted(achados)
+
+
+CARGA_AUTOMATICA_HORARIOS = _ler_horarios(CARGA_AUTOMATICA_HORARIOS_TEXTO)
+
+# Vai junto do envio automático, e só dele. Quem pediu /carga na mão já sabe que
+# o comando existe -- é a pessoa que acabou de digitá-lo. Quem recebe a prévia
+# sem ter pedido é que precisa saber que pode pedir de novo, mais tarde, e ter
+# uma atualizada em vez de reler uma tabela de três horas atrás.
+AVISO_CARGA_AUTOMATICA = (
+    'ℹ️ A carga é gerada automaticamente. Basta pedir *"/carga"* aqui no '
+    'grupo para ter uma prévia atualizada.'
+)
+
+
+def _proximo_horario_da_carga(agora, horarios=None):
+    """O próximo horário da lista. Hoje se ainda vem, senão o primeiro de amanhã."""
+    horarios = CARGA_AUTOMATICA_HORARIOS if horarios is None else horarios
+    if not horarios:
+        return None
+    for hora, minuto in horarios:
+        alvo = agora.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+        if alvo > agora:
+            return alvo
+    hora, minuto = horarios[0]
+    return (agora + timedelta(days=1)).replace(hour=hora, minute=minuto,
+                                               second=0, microsecond=0)
+
+
+def thread_agendador_carga():
+    """Manda a prévia da carga no grupo do litoral, todo dia às 15h40.
+
+    Não dispara ao subir, de propósito: o serviço reinicia várias vezes por dia
+    (bot, VPN, máquina), e um disparo por reinício encheria o grupo de prévias
+    repetidas fora de hora. É a mesma decisão da lista de garantias e do painel
+    de resultados. Quem quiser uma agora tem o comando.
+    """
+    if not CARGA_AUTOMATICA_ATIVA:
+        logger.info("Prévia automática da carga desligada (CARGA_AUTOMATICA_ATIVA=0).")
+        return
+    if not CARGA_AUTOMATICA_HORARIOS:
+        logger.warning("Prévia automática da carga sem horário válido em "
+                       "CARGA_AUTOMATICA_HORARIOS (%r). Nada será enviado.",
+                       CARGA_AUTOMATICA_HORARIOS_TEXTO)
+        return
+
+    logger.info("Agendador da prévia da carga iniciado: todo dia às %s, no grupo %s.",
+                ', '.join('%02d:%02d' % hm for hm in CARGA_AUTOMATICA_HORARIOS),
+                CARGA_AUTOMATICA_DESTINO)
+
+    while True:
+        agora = datetime.now()
+        alvo = _proximo_horario_da_carga(agora)
+        logger.info("Próxima prévia automática da carga: %s (em %.0f min).",
+                    alvo.strftime('%d/%m %H:%M'),
+                    (alvo - agora).total_seconds() / 60)
+
+        # Dorme em fatias em vez de uma vez só: numa espera de quase 24h, um
+        # relógio corrigido ou uma máquina que suspendeu fariam a thread
+        # acordar muito depois da hora. Em fatias, o alvo é reconferido.
+        while True:
+            restante = (alvo - datetime.now()).total_seconds()
+            if restante <= 0:
+                break
+            time.sleep(min(restante, 300))
+
+        # A instrução de uso vai só no PRIMEIRO envio do dia. Ela é útil uma
+        # vez; repetida três vezes por dia vira paisagem, e paisagem ninguém
+        # lê -- é a mesma razão pela qual o aviso de falha do painel é
+        # represado em vez de sair de hora em hora.
+        primeiro_do_dia = (alvo.hour, alvo.minute) == CARGA_AUTOMATICA_HORARIOS[0]
+        try:
+            gerar_e_enviar_carga(
+                destino_whatsapp=CARGA_AUTOMATICA_DESTINO,
+                telegram=False,
+                rodape=AVISO_CARGA_AUTOMATICA if primeiro_do_dia else None)
+        except Exception:
+            logger.exception("Falha no envio agendado da prévia da carga.")
+
+        # Não dispara duas vezes no mesmo minuto se o envio inteiro for rápido.
+        time.sleep(61)
 
 
 def thread_agendador_termometro_capex(intervalo_seg):
@@ -2137,6 +2597,30 @@ else:
 SOM_ALERTA_GARANTIA = os.path.join(base_dir, "assets", "alerta_garantia.mp3")
 _MCI_ALIAS_ALERTA = "alerta_garantia_som"
 
+# Dispositivo ALSA do alerta sonoro no Linux. "mistura" é o dmix declarado em
+# /etc/asound.conf do servidor -- ele existe para o bot e o navegador do painel
+# poderem tocar na TV ao mesmo tempo, em vez de um derrubar o outro. Vazio
+# desliga a tentativa e vai direto no dispositivo padrão.
+SAIDA_SOM_ALERTA = os.environ.get("SOM_ALERTA_SAIDA", "mistura")
+
+# Um alerta por vez, e um por rajada.
+#
+# `tocar_som_alerta_garantia` é chamada de DENTRO de dois laços -- a varredura
+# e a reavaliação dos pendentes -- então duas garantias na mesma passada
+# disparavam duas threads no mesmo instante. Até 27/08/2026 isso passava
+# despercebido porque a segunda quebrava (a saída HDMI é exclusiva); com o dmix
+# no lugar, as duas passaram a tocar juntas e o alerta saiu dobrado na TV.
+#
+# O alerta é um chamado de atenção, não um contador: quem olha para a TV vê no
+# painel quantas garantias entraram. Duas vezes o mesmo som ao mesmo tempo não
+# informa nada a mais e ainda embola.
+#
+# A janela é um pouco maior que o próprio arquivo (~6,5s) para o silêncio
+# separar uma rajada da seguinte, em vez de emendar.
+SOM_ALERTA_JANELA_SEG = float(os.environ.get("SOM_ALERTA_JANELA", "8"))
+_som_alerta_lock = threading.Lock()
+_som_alerta_ultimo = 0.0
+
 CAMINHO_LOGO_OPERACIONAL = os.path.join(base_dir, "assets", "logo_operacional.png")
 
 # O logo tem duas versões. A original (logo_operacional.png) tem a palavra escrita
@@ -2154,7 +2638,27 @@ def tocar_som_alerta_garantia():
     """Toca o som de alerta na máquina local -- pensado para o Painel de TV
     (a TV física de produção tem caixa de som ligada nela; o alerta sonoro
     do site, via navegador, é uma coisa separada e continua funcionando
-    independente disto)."""
+    independente disto).
+
+    Chamadas dentro da mesma janela são IGNORADAS -- ver SOM_ALERTA_JANELA_SEG.
+    """
+    global _som_alerta_ultimo
+
+    # Sem bloqueio: quem chega durante um alerta desiste em vez de esperar. Uma
+    # fila aqui só atrasaria o som e ainda tocaria tudo, que é o que se quer
+    # evitar.
+    if not _som_alerta_lock.acquire(blocking=False):
+        return
+    try:
+        agora = time.time()
+        if agora - _som_alerta_ultimo < SOM_ALERTA_JANELA_SEG:
+            logger.debug("Alerta sonoro de garantia ignorado: outro tocou há "
+                         "%.1fs.", agora - _som_alerta_ultimo)
+            return
+        _som_alerta_ultimo = agora
+    finally:
+        _som_alerta_lock.release()
+
     if not os.path.exists(SOM_ALERTA_GARANTIA):
         logger.warning(f"Arquivo de som '{os.path.basename(SOM_ALERTA_GARANTIA)}' não encontrado.")
         return
@@ -2173,9 +2677,25 @@ def tocar_som_alerta_garantia():
             except Exception as e:
                 logger.error(f"Falha ao tocar som de alerta de garantia: {e}")
     else:
-        # mpg123 troca o winmm/MCI do Windows -- toca o mp3 direto no sink de
-        # audio padrão (ALSA/Pulse/Pipewire, o que estiver rodando na
-        # máquina). "-q" só tira o textão de progresso do mpg123 do log.
+        # mpg123 troca o winmm/MCI do Windows. Três detalhes desta chamada
+        # foram pagos com um alerta que não tocou na TV, em 27/08/2026:
+        #
+        # 1. "-o alsa": sem isso o mpg123 tenta PulseAudio, depois JACK, e só
+        #    então ALSA. Nenhum dos dois primeiros existe no servidor, e a
+        #    queda de um backend para o outro com o dispositivo ocupado
+        #    termina em SEGMENTATION FAULT (medido: código 139). Forçando
+        #    ALSA, o pior caso vira um erro limpo (255).
+        #
+        # 2. "-a <dispositivo>": a saída da TV é HDMI e é EXCLUSIVA -- um
+        #    processo por vez. O navegador do painel toca o alerta dele no
+        #    mesmo instante, pelo mesmo caminho, e um dos dois perde. O
+        #    dispositivo "mistura" é um dmix declarado em /etc/asound.conf,
+        #    que deixa os dois tocarem juntos. Medido: com ele, dois e três
+        #    players simultâneos terminam todos em 0.
+        #
+        # 3. A saída de erro é LIDA. Antes ia para DEVNULL e sem check=True:
+        #    o mpg123 podia estar quebrando havia semanas sem uma linha em
+        #    lugar nenhum, e foi exatamente o que aconteceu.
         import shutil
         mpg123 = shutil.which("mpg123")
 
@@ -2186,14 +2706,38 @@ def tocar_som_alerta_garantia():
                     "'sudo apt install mpg123' para o alerta sonoro funcionar."
                 )
                 return
-            try:
-                subprocess.run(
-                    [mpg123, "-q", SOM_ALERTA_GARANTIA],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=30,
+
+            # A segunda tentativa existe para a máquina que ainda não tem o
+            # dmix no /etc/asound.conf: lá "mistura" não existe e o certo é
+            # cair no dispositivo padrão, tocando sozinho, em vez de não tocar.
+            tentativas = []
+            if SAIDA_SOM_ALERTA:
+                tentativas.append([mpg123, "-o", "alsa", "-a", SAIDA_SOM_ALERTA,
+                                   "-q", SOM_ALERTA_GARANTIA])
+            tentativas.append([mpg123, "-o", "alsa", "-q", SOM_ALERTA_GARANTIA])
+
+            for indice, comando in enumerate(tentativas):
+                try:
+                    r = subprocess.run(comando, capture_output=True, text=True,
+                                       timeout=30)
+                except Exception as e:
+                    logger.error(f"Falha ao tocar som de alerta de garantia: {e}")
+                    return
+                if r.returncode == 0:
+                    return
+                erro = (r.stderr or "").strip().splitlines()
+                # O mpg123 reclama de PulseAudio e JACK mesmo quando funciona;
+                # essas linhas não são o problema e só atrapalham a leitura.
+                erro = [l for l in erro
+                        if not re.search(r"jack|pulse|Cannot connect", l, re.I)]
+                logger.warning(
+                    "Som de alerta: '%s' terminou com código %s%s",
+                    " ".join(comando[:5]), r.returncode,
+                    f" -- {erro[-1]}" if erro else "",
                 )
-            except Exception as e:
-                logger.error(f"Falha ao tocar som de alerta de garantia: {e}")
+            logger.error(
+                "Som de alerta de garantia NÃO tocou: todas as saídas falharam."
+            )
 
     threading.Thread(target=_tocar, daemon=True).start()
 
@@ -2350,7 +2894,20 @@ def carregar_base_ofs():
 
         df[col_contrato] = _tratar_contrato_serie(df[col_contrato])
         df[col_data] = pd.to_datetime(df[col_data], errors='coerce', dayfirst=True)
-        df = df[df[col_status].astype(str).str.contains('conclu', case=False, na=False)]
+        # "conclu" casa com "concluído" E com "não concluído" -- e o OFS usa os
+        # dois textos. Enquanto a base chegava filtrada da mão de alguém isso
+        # nunca apareceu, porque a exportação manual já vinha só com concluído.
+        # Desde que o bot passou a montar a base sozinho (ofs_base_historica),
+        # a diferença é real: medido em 26/08/2026 numa janela de 60 dias, o
+        # filtro frouxo trazia 8.340 linhas contra 7.131 -- 1.209 serviços NÃO
+        # concluídos entrando como concluídos, cada um valendo uma garantia
+        # que não existe. Segue comparando por pedaço, para aguentar variação
+        # de acento e caixa; o que não entra é a negação.
+        status_normalizado = (df[col_status].astype(str).str.strip().str.lower()
+                              .str.normalize('NFKD')
+                              .str.encode('ascii', 'ignore').str.decode('ascii'))
+        df = df[status_normalizado.str.contains('conclu', na=False)
+                & ~status_normalizado.str.startswith('nao')]
 
         colunas = {
             'contrato': col_contrato,
@@ -2599,6 +3156,92 @@ def notificar_improdutiva_telegram(unidade, contrato, nome_cliente, bairro,
 
     return enviar_alerta_telegram(f"<b>{chr(10).join(linhas)}</b>", parse_mode="HTML",
                                   destino=regiao_da_unidade(unidade))
+
+
+# ---------------------------------------------------------------------------
+# Endereço em área de risco
+#
+# Mesma pergunta por entrante que a reincidência de improdutiva, com outra
+# fonte: o mapa da operação do Rio (area_risco.py). Aqui não há base exportada
+# nem janela de dias -- ou o endereço cai dentro da área desenhada, ou não cai.
+#
+# O aviso é SEPARADO do alerta de CAPEX de propósito, e não uma linha a mais
+# nele: a ação é outra. O entrante é roteirização; área de risco é quem entra,
+# com quem, e a que hora. Duas mensagens deixam a segunda ser encaminhada
+# sozinha para quem decide isso.
+# ---------------------------------------------------------------------------
+def coordenada_do_chamado(chamado):
+    """(lat, lng) do endereço, ou (None, None).
+
+    A coordenada mora em `ordemServicos[]`, não na raiz do chamado -- e é a
+    ÚLTIMA ordem que vale, pela mesma razão que o backlog lê o pacote de lá:
+    é a que descreve a visita que vai acontecer. Chamado recém-aberto pode não
+    ter ordem nenhuma ainda, e endereço mal cadastrado vem com lat/lng nulos
+    (1 em 7 na amostra de 28/08/2026). Nos dois casos a resposta é (None,
+    None), e area_risco.consultar cai para a lista de ruas.
+    """
+    # Duas formas de chamado passam por aqui, e as duas tem de funcionar: o
+    # chamado CRU da API, onde a coordenada esta dentro de `ordemServicos`, e
+    # o projetado do cache (projetar_para_cache), que ja subiu lat/lng para a
+    # raiz porque `ordemServicos` nao sobrevive a projecao. A raiz vem
+    # primeiro so porque e o caso barato.
+    if chamado.get('lat') is not None or chamado.get('lng') is not None:
+        return chamado.get('lat'), chamado.get('lng')
+    ordens = chamado.get('ordemServicos') or []
+    if not ordens or not isinstance(ordens[-1], dict):
+        return None, None
+    ultima = ordens[-1]
+    return ultima.get('lat'), ultima.get('lng')
+
+
+def notificar_area_risco_telegram(unidade, contrato, nome_cliente, bairro,
+                                  telefones_str, achado, agendamento=None):
+    """Aviso de endereço em área de risco. Com `agendamento`, é uma REMARCAÇÃO."""
+    titulo = "REMARCADA EM ÁREA DE RISCO" if agendamento else "ÁREA DE RISCO"
+    linhas = [
+        f"{titulo}: {html.escape(str(unidade))}",
+        f"• Contrato: {html.escape(str(contrato))}",
+        f"• Cliente: {html.escape(str(nome_cliente))}",
+        f"• Bairro: {html.escape(str(bairro))}",
+        f"• Rua: {html.escape(str(achado['rua']))}",
+        f"• Telefone(s): {telefones_str}",
+    ]
+    if agendamento:
+        linhas.append(f"• Agendamento: {html.escape(str(agendamento))}")
+
+    # Por qual das duas vias casou. Quem lê no grupo precisa saber o quanto
+    # conferir: o polígono é o desenho da operação batido contra a coordenada
+    # do endereço, e é o mais firme dos três. A lista de ruas é uma cópia à
+    # mão do quadro, e quando ela casa com a coordenada caindo FORA do
+    # desenho, alguma das duas está errada -- normalmente o número da casa no
+    # cadastro, às vezes o quadro, que é mais velho que o mapa.
+    if achado.get('casou_por') == 'mapa':
+        linhas.append(f"• Casou por: mapa — {html.escape(str(achado.get('area')))}")
+    elif achado.get('coordenada'):
+        linhas.append("• Casou por: lista de ruas — a coordenada do chamado caiu "
+                      "FORA do desenho, confira o endereço")
+    else:
+        linhas.append("• Casou por: lista de ruas (chamado sem coordenada)")
+
+    return enviar_alerta_telegram(f"<b>{chr(10).join(linhas)}</b>", parse_mode="HTML",
+                                  destino=regiao_da_unidade(unidade))
+
+
+def verificar_area_risco(unidade, bairro, logradouro, lat=None, lng=None):
+    """Devolve o registro de área de risco, ou None.
+
+    Nunca levanta -- mesma razão de verificar_improdutiva_anterior: falhar
+    aqui custa um aviso a menos; falhar no alerta do entrante custa uma O.S.
+    que ninguém viu.
+    """
+    try:
+        return area_risco.consultar(unidade, bairro, logradouro, lat, lng)
+    except Exception:
+        logger.exception(
+            "Falha ao consultar o mapa de área de risco. O entrante segue "
+            "sendo notificado normalmente, só sem este aviso."
+        )
+        return None
 
 
 def _data_agendamento(valor):
@@ -2857,9 +3500,15 @@ def montar_mensagem_improdutivas(dados, whatsapp=False):
     return "\n".join(linhas).strip()
 
 
-def responder_improdutivas(whatsapp=False):
-    """Monta e envia a lista consolidada no grupo onde os comandos vivem."""
-    enviar = enviar_alerta_whatsapp_grupo if whatsapp else enviar_alerta_telegram
+def responder_improdutivas(whatsapp=False, destino=None):
+    """Monta e envia a lista consolidada onde o comando foi dado.
+
+    `destino` é o JID de quem pediu, quando o pedido veio de uma conversa
+    privada. Sem ele, vai para o grupo de comandos, que é de onde este comando
+    sempre veio.
+    """
+    enviar = ((lambda texto: enviar_alerta_whatsapp_grupo(texto, destino=destino))
+              if whatsapp else enviar_alerta_telegram)
     try:
         dados = montar_lista_improdutivas_abertas(obter_lista_chamados_atual())
     except Exception:
@@ -2886,6 +3535,522 @@ def responder_improdutivas(whatsapp=False):
         tamanho += len(linha) + 1
     if atual:
         enviar("\n".join(atual))
+
+
+# ============ /risco: os CAPEX abertos em área de risco (28/08/2026) ============
+#
+# Irmã do /improdutivas, e pela mesma razão: o alerta de área de risco é
+# EVENTO -- conta que uma O.S. entrou e some na conversa do grupo. Quem monta
+# roteiro pergunta outra coisa, "o que está de pé agora", e a resposta não
+# pode vir de rolar mensagem antiga.
+#
+# Também como lá, a lista se monta varrendo os CAPEX abertos no CAMPO neste
+# momento, com a MESMA regra do aviso (area_risco.consultar). O.S. que fechou
+# some sozinha, sem ninguém dar baixa.
+def montar_lista_area_risco_abertas(lista_chamados):
+    """{'litoral': [...], 'rj': [...], 'total': n, 'analisados': n}.
+
+    Nunca levanta: é resposta a comando no grupo, e falhar aqui tem de virar
+    um recado, não um traceback que só aparece no log.
+    """
+    por_regiao = {'litoral': [], 'rj': []}
+    de_qual_regiao = {}
+    for sigla in LITORAL_SP:
+        de_qual_regiao[sigla] = 'litoral'
+    for sigla in RJ:
+        de_qual_regiao[sigla] = 'rj'
+
+    analisados = 0
+    sem_coordenada = 0
+    for chamado in (lista_chamados or ()):
+        if not isinstance(chamado, dict):
+            continue
+
+        fila = chamado.get('fila')
+        if isinstance(fila, dict):
+            codigo = fila.get('codigo')
+        elif isinstance(fila, str):
+            codigo = fila
+        else:
+            codigo = chamado.get('codigo')
+        if codigo not in CODIGOS_ALVO:
+            continue
+
+        unidade = str(chamado.get('enderecoUnidade', '')).upper().strip()
+        regiao = de_qual_regiao.get(unidade)
+        if not regiao:
+            continue
+
+        analisados += 1
+        bairro = str(chamado.get('enderecoBairro') or 'N/D')
+        logradouro = chamado.get('enderecoLogradouro')
+        lat, lng = coordenada_do_chamado(chamado)
+        if area_risco.coordenada_valida(lat, lng) is None:
+            sem_coordenada += 1
+
+        achado = verificar_area_risco(unidade, bairro, logradouro, lat, lng)
+        if not achado:
+            continue
+
+        data_agenda = _data_agendamento(chamado.get('agendamentoData'))
+        por_regiao[regiao].append({
+            'os_id': chamado.get('id'),
+            'unidade': unidade,
+            'contrato': str(chamado.get('codigoContrato', 'N/D')),
+            'cliente': str(chamado.get('nomeCliente') or 'N/D').strip() or 'N/D',
+            'bairro': bairro,
+            'rua': str(achado.get('rua') or 'N/D'),
+            'casou_por': achado.get('casou_por'),
+            'area': achado.get('area'),
+            'coordenada': achado.get('coordenada'),
+            'agendamento': data_agenda.strftime('%d/%m') if data_agenda else None,
+            'ordem_agenda': data_agenda or datetime.max,
+        })
+
+    for itens in por_regiao.values():
+        # Quem tem visita marcada mais cedo primeiro; sem data vai para o fim,
+        # que é a ordem em que a operação precisa agir.
+        itens.sort(key=lambda i: (i['ordem_agenda'], i['unidade'], i['contrato']))
+
+    return {
+        'litoral': por_regiao['litoral'],
+        'rj': por_regiao['rj'],
+        'total': len(por_regiao['litoral']) + len(por_regiao['rj']),
+        'analisados': analisados,
+        'sem_coordenada': sem_coordenada,
+        'gerado_em': datetime.now().strftime('%d/%m/%Y %H:%M'),
+    }
+
+
+def _bloco_area_risco(titulo, itens, negrito):
+    linhas = [f"{negrito}{titulo} ({len(itens)}){negrito}", ""]
+    for item in itens:
+        cabeca = f"• {item['contrato']} — {item['unidade']}"
+        if item['agendamento']:
+            cabeca += f" — agenda {item['agendamento']}"
+        linhas.append(cabeca)
+        linhas.append(f"   {item['cliente']} · {item['bairro']}")
+        linhas.append(f"   {item['rua']}")
+        # Mesma ressalva do aviso individual: quem lê tem de saber o quanto
+        # conferir ANTES de mandar técnico.
+        if item['casou_por'] == 'mapa':
+            linhas.append(f"   dentro do mapa: {item['area']}")
+        elif item['coordenada']:
+            linhas.append("   pela lista de ruas · a coordenada caiu FORA do "
+                          "desenho (confira o endereço)")
+        else:
+            linhas.append("   pela lista de ruas · chamado sem coordenada")
+        linhas.append("")
+    return linhas
+
+
+def montar_mensagem_area_risco(dados, whatsapp=False):
+    """O texto do /risco. `whatsapp` troca o negrito de HTML para *."""
+    negrito = "*" if whatsapp else ""
+    cabecalho = f"{negrito}CAPEX EM ÁREA DE RISCO{negrito}"
+
+    if dados['total'] == 0:
+        return (f"{cabecalho}\n_{dados['gerado_em']}_\n\n"
+                f"Nenhum CAPEX em aberto em área de risco "
+                f"({dados['analisados']} analisado(s)).")
+
+    linhas = [
+        cabecalho,
+        f"_{dados['total']} de {dados['analisados']} CAPEX abertos · {dados['gerado_em']}_",
+        "",
+    ]
+    linhas += _bloco_area_risco("SUL RJ", dados['rj'], negrito)
+    # O litoral só aparece se tiver algo: o mapa da operação cobre VRD e BMA e
+    # mais nada, então imprimir "LITORAL NORTE SP: nenhuma" toda vez seria
+    # ruído garantido. Se um dia desenharem área em SP, o bloco aparece
+    # sozinho -- e é justamente aí que ele tem de ser visto.
+    if dados['litoral']:
+        linhas += _bloco_area_risco("LITORAL NORTE SP", dados['litoral'], negrito)
+    return "\n".join(linhas).strip()
+
+
+def responder_area_risco(whatsapp=False, destino=None):
+    """Monta e envia a lista de área de risco onde o comando foi dado."""
+    enviar = ((lambda texto: enviar_alerta_whatsapp_grupo(texto, destino=destino))
+              if whatsapp else enviar_alerta_telegram)
+    try:
+        dados = montar_lista_area_risco_abertas(obter_lista_chamados_atual())
+    except Exception:
+        logger.exception("Falha ao montar a lista de CAPEX em área de risco.")
+        enviar("⚠️ Não consegui montar a lista de área de risco. Veja o log.")
+        return
+
+    if dados['sem_coordenada']:
+        # Não é enfeite: é o número que diz o quanto a lista dependeu da via
+        # fraca. Com muitos chamados sem coordenada, o que faltar no quadro de
+        # ruas não aparece aqui -- e ninguém teria como desconfiar disso.
+        logger.info(
+            f"/risco: {dados['total']} em área de risco de {dados['analisados']} "
+            f"CAPEX abertos; {dados['sem_coordenada']} sem coordenada utilizável."
+        )
+
+    texto = montar_mensagem_area_risco(dados, whatsapp=whatsapp)
+
+    # A mensagem cresce com a operação; quebrar por linha evita esbarrar no
+    # limite do Telegram (4096). Mesmo tratamento do /improdutivas.
+    limite = 3500
+    if len(texto) <= limite:
+        enviar(texto)
+        return
+    atual = []
+    tamanho = 0
+    for linha in texto.split("\n"):
+        if tamanho + len(linha) + 1 > limite and atual:
+            enviar("\n".join(atual))
+            time.sleep(1.0)
+            atual, tamanho = [], 0
+        atual.append(linha)
+        tamanho += len(linha) + 1
+    if atual:
+        enviar("\n".join(atual))
+
+
+# ---------------------------------------------------------------------------
+# /bot: pergunta em português no grupo, resposta pensada em cima da operação
+#
+# Os outros comandos respondem a uma pergunta fixa cada um. Este responde a
+# pergunta que a pessoa fizer -- "o que dá para adiantar em VRD?", "qual
+# unidade está pior hoje?" -- montando um dossiê com o retrato da operação e
+# mandando pergunta e dossiê para o Gemini (ver assistente_ia.py e
+# dossie_operacao.py).
+#
+# O que sustenta a confiança na resposta: os números do dossiê já vêm
+# apurados pelas MESMAS funções que geram as imagens de backlog. O modelo lê
+# totais prontos e rótulos prontos; ele não conta 345 linhas nem compara datas
+# de cabeça. Em teste, com as datas cruas na tabela, ele chamou de vencida uma
+# O.S. sem agenda -- daí os rótulos virem mastigados de lá.
+#
+# O que continua sendo verdade mesmo assim: é IA, e resposta de IA é apoio à
+# decisão, não relatório auditado. Por isso toda resposta sai com o horário
+# do retrato e um pedido explícito de conferência.
+#
+# A IA não executa nada. Ela devolve texto, e só. Nenhum comando de controle
+# passa por aqui.
+# ---------------------------------------------------------------------------
+def montar_dossie_atual():
+    """O retrato da operação em texto, ou None se nem a lista de chamados houver.
+
+    Cada fonte entra dentro do seu próprio try: uma planilha fora do ar ou o
+    OFS sem exportação do dia tiram UMA seção do dossiê, e o dossiê diz que
+    aquilo faltou. Derrubar a resposta inteira porque uma fonte faltou seria o
+    contrário do que o grupo precisa.
+    """
+    # Logo depois de subir, o bot ja atende comando mas ainda nao varreu o CAMPO
+    # -- e sem lista de chamados o dossie nao existe. Visto em 31/08/2026: uma
+    # pergunta chegou as 15:29:05 e a primeira varredura terminou as 15:29:08,
+    # tres segundos depois. A pessoa recebeu "nao consegui montar o retrato" e
+    # nao tinha como saber que bastava repetir.
+    #
+    # Esperar alguns segundos resolve o caso inteiro, porque a janela e curta:
+    # a varredura roda a cada 25s e a primeira sai logo apos a carga inicial.
+    # Quem pergunta ja esta esperando o "Pensando..." de qualquer jeito.
+    lista = obter_lista_chamados_atual()
+    if not lista:
+        limite = time.time() + ESPERA_PRIMEIRA_VARREDURA_SEG
+        while not lista and time.time() < limite:
+            time.sleep(2)
+            lista = obter_lista_chamados_atual()
+        if lista:
+            logger.info('Dossie: a lista de chamados chegou durante a espera '
+                        'da primeira varredura.')
+    if not lista:
+        logger.warning('Dossie: sem lista de chamados apos %ss de espera.',
+                       ESPERA_PRIMEIRA_VARREDURA_SEG)
+        return None
+
+    try:
+        conveniencias = carregar_conveniencias()
+    except Exception:
+        logger.warning("Dossiê: sem a planilha de conveniência nesta consulta.")
+        conveniencias = []
+
+    try:
+        contratos_ofs_d0, info_ofs = carregar_contratos_ofs_do_dia()
+    except Exception:
+        logger.warning("Dossiê: sem o cruzamento com o OFS GERAL nesta consulta.")
+        contratos_ofs_d0, info_ofs = None, None
+
+    def tentar(o_que, funcao):
+        try:
+            return funcao()
+        except Exception:
+            logger.exception("Dossiê: falha ao montar %s. Segue sem essa parte.",
+                             o_que)
+            return None
+
+    # O Autenticador é a única fonte aqui que custa uma chamada de rede a cada
+    # pergunta. Fica ligável: em dia de Autenticador lento, DOSSIE_AUTENTICADOR=0 devolve
+    # a resposta rápida e o dossiê passa a dizer que essa fonte não veio --
+    # em vez de o /bot inteiro ficar pendurado esperando.
+    status_autenticador = None
+    if os.environ.get('DOSSIE_AUTENTICADOR', '1') != '0':
+        def consultar_o_autenticador():
+            contratos = coletar_contratos_reparo_abertos(lista)
+            if not contratos:
+                return None
+            tabela, erro = consultar_autenticador_status(contratos)
+            if erro:
+                logger.warning("Dossiê: Autenticador devolveu erro: %s", erro)
+                return None
+            por_contrato = {}
+            for _, linha in tabela.iterrows():
+                contrato = str(linha.get('CONTRATO', '')).strip()
+                if contrato:
+                    por_contrato[contrato] = str(linha.get('STATUS', '')).strip().upper()
+            return por_contrato or None
+        status_autenticador = tentar('o status do Autenticador', consultar_o_autenticador)
+
+    capex = tentar('o backlog de CAPEX', lambda: calcular_backlog_capex(
+        lista, conveniencias, contratos_ofs_d0=contratos_ofs_d0 or set()))
+    reparo = tentar('o backlog de reparo', lambda: calcular_backlog_reparo(
+        lista, status_autenticador_por_contrato=status_autenticador,
+        conveniencias=conveniencias,
+        contratos_ofs_d0=contratos_ofs_d0 or set()))
+    improdutivas_abertas = tentar('as improdutivas reincidentes',
+                                  lambda: montar_lista_improdutivas_abertas(lista))
+    risco_aberto = tentar('a área de risco',
+                          lambda: montar_lista_area_risco_abertas(lista))
+
+    # A MESMA lista que o /garantias manda para os grupos regionais, montada
+    # pela mesma função. Se um dia as duas divergirem, é defeito.
+    def montar_as_garantias():
+        reparos, abertas, _carimbo = estado_para_lista_garantias()
+        return garantias_lista.montar(reparos, abertas,
+                                      status_por_contrato=status_autenticador)
+    garantias_abertas = tentar('a lista de garantias', montar_as_garantias)
+
+    agenda_ofs = tentar('a exportação do OFS do dia',
+                        lambda: dossie_operacao.ler_agenda_ofs(ARQUIVO_OFS_DO_DIA))
+    base_historica = tentar('o estado da base histórica do OFS',
+                            ofs_base_historica.estado_atual)
+
+    def montar_o_termometro():
+        return {
+            'contagem': obter_entrantes_capex_hoje(),
+            'media_geral': calcular_media_historica_geral_entrantes_capex(),
+        }
+    termometro = tentar('o termômetro de entrantes', montar_o_termometro)
+
+    with _stats_lock:
+        estatisticas = dict(ESTATISTICAS_STATUS)
+
+    return dossie_operacao.montar(
+        agora=datetime.now(),
+        chamados=lista,
+        capex=capex,
+        reparo=reparo,
+        contratos_ofs_d0=contratos_ofs_d0,
+        info_ofs=info_ofs,
+        improdutivas=improdutivas_abertas,
+        risco=risco_aberto,
+        garantias=garantias_abertas,
+        estatisticas=estatisticas,
+        agenda_ofs=agenda_ofs,
+        autenticador=status_autenticador,
+        termometro=termometro,
+        base_historica=base_historica,
+    )
+
+
+def montar_buscador_atual():
+    """O braço de busca do assistente, preso aos dados deste instante.
+
+    Recebe a MESMA lista de chamados que o dossiê usou. Se a busca lesse a sua
+    própria cópia, o retrato e a resposta poderiam discordar sobre o que está
+    aberto -- e a divergência apareceria como um bot que se contradiz na mesma
+    mensagem.
+
+    Vale também na réplica de uma conversa, onde o dossiê não é remontado: o
+    retrato continua sendo o da primeira volta, mas a busca segue disponível,
+    porque procurar um contrato não muda o retrato de nada.
+    """
+    try:
+        return busca_operacao.Buscador(
+            chamados=obter_lista_chamados_atual(),
+            caminho_ofs_geral=localizar_ofs_geral(),
+            agora=datetime.now(),
+        )
+    except Exception:
+        logger.exception("Falha ao preparar as buscas do /bot. "
+                         "A resposta sai só com o dossiê.")
+        return None
+
+
+def arrumar_formatacao(texto):
+    """Deixa a resposta do modelo apresentavel, sem confiar que ela ja veio.
+
+    O modelo segue a instrucao quase sempre, e "quase" nao serve para o que
+    vai ao grupo: um asterisco solto vira erro 400 no Telegram e a mensagem
+    inteira nao chega.
+
+    - asterisco impar: sobra um, e ele sai. Negrito aberto e nao fechado faz
+      o WhatsApp engolir o resto do paragrafo;
+    - marcador de lista: o modelo alterna entre "-", "*" e "+". O "*" no
+      comeco da linha e o pior dos tres, porque o WhatsApp o le como negrito.
+      Todos viram o mesmo ponto, que e o que a operacao ja ve nos alertas;
+    - titulo de Markdown ("## Resumo"): nao existe no WhatsApp, vira negrito;
+    - linha em branco dupla: uma so basta, e o celular agradece;
+    - espaco no fim da linha: invisivel, e desalinha quando o texto quebra.
+    """
+    if not texto:
+        return texto
+
+    linhas = []
+    for linha in texto.split("\n"):
+        linha = linha.rstrip()
+        despido = linha.lstrip()
+        recuo = linha[:len(linha) - len(despido)]
+
+        if despido.startswith('#'):
+            despido = despido.lstrip('#').strip()
+            if despido:
+                despido = '*' + despido + '*'
+        elif despido[:2] in ('- ', '* ', '+ '):
+            despido = '• ' + despido[2:].lstrip()
+
+        linhas.append(recuo + despido)
+
+    limpo = []
+    for linha in linhas:
+        if not linha and limpo and not limpo[-1]:
+            continue
+        limpo.append(linha)
+
+    texto = "\n".join(limpo).strip()
+
+    if texto.count('*') % 2:
+        corte = texto.rfind('*')
+        texto = texto[:corte] + texto[corte + 1:]
+    return texto
+
+
+def enviar_em_pedacos(enviar, texto, limite=3500):
+    """Manda o texto quebrado por linha, respeitando o limite do Telegram."""
+    texto = arrumar_formatacao(texto)
+    if len(texto) <= limite:
+        enviar(texto)
+        return
+    atual = []
+    tamanho = 0
+    for linha in texto.split("\n"):
+        if tamanho + len(linha) + 1 > limite and atual:
+            # Cada pedaco vai arrumado por si. Uma quebra no meio de um
+            # negrito deixaria o primeiro pedaco com asterisco aberto e o
+            # segundo comecando com um asterisco solto -- os dois errados.
+            enviar(arrumar_formatacao("\n".join(atual)))
+            time.sleep(1.0)
+            atual, tamanho = [], 0
+        atual.append(linha)
+        tamanho += len(linha) + 1
+    if atual:
+        enviar(arrumar_formatacao("\n".join(atual)))
+
+
+def responder_pergunta_bot(pergunta, whatsapp=False, chave=None,
+                           historico=None, destino=None):
+    """Uma volta da conversa do /bot.
+
+    Com `historico`, esta é a réplica a uma pergunta que o próprio bot fez: o
+    dossiê não é remontado, porque ele já está dentro do histórico e remontá-lo
+    faria a segunda volta responder sobre um retrato diferente do da primeira
+    -- que é o tipo de inconsistência que ninguém consegue depurar depois.
+
+    `destino` é o JID de uma conversa privada. Sem ele, a resposta vai para o
+    grupo de comandos, que é o que sempre aconteceu. Ele NÃO tem padrão de
+    propósito: uma pergunta feita reservadamente respondida no grupo seria um
+    vazamento silencioso, e o jeito de não errar isso é a resposta ir para
+    onde a pergunta veio, sempre explicitamente.
+    """
+    if whatsapp:
+        def enviar(mensagem):
+            return enviar_alerta_whatsapp_grupo(mensagem, destino=destino)
+    else:
+        # Markdown para o negrito valer no Telegram. O WhatsApp entende
+        # *assim* nativamente; o Telegram so com parse_mode. Se ele recusar o
+        # texto, o proprio enviar_alerta_telegram reenvia sem formatacao.
+        def enviar(mensagem):
+            return enviar_alerta_telegram(mensagem, parse_mode='Markdown')
+    pendentes = (AGUARDANDO_RESPOSTA_BOT_WHATSAPP if whatsapp
+                 else AGUARDANDO_RESPOSTA_BOT)
+
+    dossie = None
+    if historico is None:
+        try:
+            dossie = montar_dossie_atual()
+        except Exception:
+            logger.exception("Falha ao montar o dossiê para o /bot.")
+
+    resultado = assistente_ia.responder(pergunta, dossie,
+                                        historico=historico,
+                                        buscador=montar_buscador_atual())
+    texto = resultado['texto']
+
+    if resultado['ok'] and resultado['aguardando']:
+        # O bot devolveu uma PERGUNTA em vez de uma resposta. Fica escutando o
+        # grupo pela réplica, do mesmo jeito que o /autenticador espera o contrato.
+        if chave is not None:
+            pendentes[chave] = {
+                'quando': time.time(),
+                'historico': resultado['historico'],
+            }
+        texto += ("\n\n(responda aqui mesmo, sem /bot, nos próximos "
+                  f"{TIMEOUT_CONVERSA_BOT_SEG // 60} minutos)")
+    else:
+        if chave is not None:
+            pendentes.pop(chave, None)
+        if resultado['ok']:
+            # Sem rodape. O aviso de "resposta de IA" e a hora do
+            # retrato sairam em 31/08/2026, a pedido: a operacao sabe
+            # que o /bot e um robo, e a resposta e curta de proposito
+            # -- duas linhas de rodape em cada uma eram ruido.
+            #
+            # O que a hora resolvia continua existindo: a resposta
+            # vale para o instante em que foi feita, e o horario da
+            # propria mensagem no WhatsApp diz qual foi.
+            pass
+
+    enviar_em_pedacos(enviar, texto)
+
+
+def continuar_conversa_bot(chave, texto_bruto, whatsapp=False, destino=None):
+    """A mensagem é réplica a uma pergunta do /bot? Trata e devolve True.
+
+    Devolve False quando não havia conversa aberta -- aí a mensagem segue o
+    caminho normal, sem o bot se meter na conversa do grupo.
+    """
+    pendentes = (AGUARDANDO_RESPOSTA_BOT_WHATSAPP if whatsapp
+                 else AGUARDANDO_RESPOSTA_BOT)
+    pendente = pendentes.get(chave)
+    if not pendente:
+        return False
+
+    pendentes.pop(chave, None)
+    # A resposta volta para onde a pergunta veio. No grupo,
+    # `destino` e None e vale o comportamento de sempre.
+    if whatsapp:
+        def enviar(mensagem):
+            return enviar_alerta_whatsapp_grupo(mensagem, destino=destino)
+    else:
+        enviar = enviar_alerta_telegram
+    if (time.time() - pendente['quando']) > TIMEOUT_CONVERSA_BOT_SEG:
+        enviar("\u23f1\ufe0f Passou do tempo de responder. "
+               "Recomece com /bot.")
+        return True
+
+    threading.Thread(
+        target=responder_pergunta_bot,
+        args=(texto_bruto,),
+        kwargs={'whatsapp': whatsapp, 'chave': chave,
+                'historico': pendente['historico'],
+                'destino': destino},
+        daemon=True,
+    ).start()
+    return True
 
 
 # A trava é o conjunto de O.S. de reparo vistas ABERTAS na última varredura
@@ -3712,16 +4877,19 @@ def processar_consulta_autenticador_telegram(texto_recebido):
     enviar_alerta_telegram(mensagem, parse_mode="Markdown")
 
 
-def processar_consulta_autenticador_whatsapp(texto_recebido):
-    """Recebe o texto digitado após o /autenticador no grupo do WhatsApp, consulta
-    e responde SÓ no WhatsApp (não usa enviar_alerta_telegram, que também
-    replicaria a resposta para o grupo do Telegram)."""
+def processar_consulta_autenticador_whatsapp(texto_recebido, destino=None):
+    """Recebe o texto digitado após o /autenticador no WhatsApp, consulta e responde
+    SÓ no WhatsApp (não usa enviar_alerta_telegram, que também replicaria a
+    resposta para o grupo do Telegram).
+
+    `destino` é o JID de quem pediu, quando veio de uma conversa privada."""
     contratos = _extrair_contratos_do_texto(texto_recebido)
 
     if not contratos:
         enviar_alerta_whatsapp_grupo(
             "⚠️ Não identifiquei nenhum número de contrato válido. "
-            "Envie /autenticador novamente e digite apenas o número do contrato."
+            "Envie /autenticador novamente e digite apenas o número do contrato.",
+            destino=destino,
         )
         return
 
@@ -3729,10 +4897,13 @@ def processar_consulta_autenticador_whatsapp(texto_recebido):
     df, erro = consultar_autenticador_status(contratos)
 
     if erro:
-        enviar_alerta_whatsapp_grupo(f"⚠️ Erro ao consultar o Autenticador:\n{erro}")
+        enviar_alerta_whatsapp_grupo(f"⚠️ Erro ao consultar o Autenticador:\n{erro}",
+                                     destino=destino)
         return
     if df is None or df.empty:
-        enviar_alerta_whatsapp_grupo("⚠️ Nenhuma informação retornada pelo Autenticador para o(s) contrato(s) informado(s).")
+        enviar_alerta_whatsapp_grupo(
+            "⚠️ Nenhuma informação retornada pelo Autenticador para o(s) contrato(s) informado(s).",
+            destino=destino)
         return
 
     dbm_por_contrato = {}
@@ -3748,7 +4919,7 @@ def processar_consulta_autenticador_whatsapp(texto_recebido):
             time.sleep(random.uniform(1.5, 3.0))
 
     mensagem = formatar_mensagem_autenticador(df, dbm_por_contrato, para_telegram=False)
-    enviar_alerta_whatsapp_grupo(mensagem)
+    enviar_alerta_whatsapp_grupo(mensagem, destino=destino)
 
 
 def _converter_mensagem_para_whatsapp(mensagem, parse_mode):
@@ -4209,6 +5380,16 @@ def enviar_alerta_telegram(mensagem, parse_mode=None, destino=None):
         payload["parse_mode"] = parse_mode
     try:
         resposta = requests.post(url, json=payload, timeout=10)
+        if resposta.status_code == 400 and parse_mode:
+            # O Telegram recusa Markdown malformado com 400 e NAO entrega
+            # nada. Como o texto do /bot e escrito por um modelo, um
+            # sublinhado solto num nome basta para isso acontecer. Reenviar
+            # sem formatacao troca o negrito pela certeza de chegar, que e a
+            # troca certa: quem esta no grupo precisa da resposta.
+            logger.warning("Telegram recusou a formatacao (%s). Reenviando "
+                           "sem parse_mode.", resposta.text[:160])
+            payload.pop("parse_mode", None)
+            resposta = requests.post(url, json=payload, timeout=10)
         if resposta.status_code != 200:
             logger.error(f"Telegram retornou {resposta.status_code}: {resposta.text}")
             return None
@@ -4410,10 +5591,15 @@ def montar_mensagem_painel():
 def montar_mensagem_comandos(whatsapp=False):
     """Lista de comandos disponíveis, mostrada quando alguém pede /comandos.
 
-    O WhatsApp aceita 'backlog' e 'termometro' sem a barra, então a lista é
-    montada com o prefixo certo para cada canal.
+    Os dois canais aceitam a mesma sintaxe COM barra. O WhatsApp continua
+    aceitando 'backlog', 'termometro', 'ligar' e afins sem ela, por herança,
+    mas a lista mostra só a forma com barra: uma sintaxe só para decorar, e
+    quem vem do Telegram não digita um comando que morre no silêncio.
+
+    O parâmetro `whatsapp` ficou sem efeito quando as listas se igualaram
+    (25/08/2026); segue aceito porque as duas chamadas ainda o passam.
     """
-    barra = "" if whatsapp else "/"
+    barra = "/"
     tipos = ", ".join(TIPOS_BACKLOG_VALIDOS)
 
     linhas = [
@@ -4422,14 +5608,36 @@ def montar_mensagem_comandos(whatsapp=False):
         f"📊 *{barra}backlog* — gera o backlog de todos os tipos",
         f"     _{barra}backlog {tipos}_ para um tipo só",
         f"🌡️ *{barra}termometro* — termômetro de entrantes CAPEX",
+        f"📋 *{barra}carga* — prévia da carga de AMANHÃ no Litoral Norte"
+        " (balde e rotas): a capa e a lista detalhada, em imagem",
+        "     _sai sozinha às 15h40 no grupo do litoral; atualiza a base no"
+        " OFS antes de contar_",
         "🛠️ *​/improdutivas* — reincidentes de improdutiva em aberto, por região",
+        f"🔔 *{barra}alertas* — liga/desliga o aviso de *Upgrade* e"
+        " *Mudança de cômodo*, por região",
+        "     _o bot pergunta onde: Litoral Norte, Sul RJ ou as duas_",
+        "⚠️ *​/risco* — CAPEX em aberto dentro das áreas de risco do RJ",
+        # O /bot é o único comando que não devolve um relatório pronto: é uma
+        # IA lendo os nossos dados e concluindo. Quem lê o menu precisa sair
+        # sabendo as três coisas que mudam como a resposta deve ser tratada --
+        # que é IA, que ela só enxerga o que temos, e que a resposta merece
+        # conferência. Sem isso, o grupo lê a resposta como se fosse consulta
+        # ao sistema, que é justamente o que ela não é.
+        "🧠 *​/bot* — inteligência artificial que pensa em cima dos NOSSOS"
+        " dados: backlog do CAMPO, agenda do OFS, garantias, improdutivas,"
+        " área de risco e o histórico de contratos e de rotas",
+        "     _ex: /bot o que dá para adiantar em VRD?_",
+        "     _ex: /bot o contrato 6884951 já foi atendido?_",
+        "     _ex: /bot como está a rota do Fabiano hoje?_",
+        "     _Sem pergunta, /bot sozinho faz o diagnóstico do momento._"
+        " _Se a pergunta ficar vaga ele devolve outra pergunta: responda"
+        " ali mesmo, sem /bot. Confira antes de agir._",
         f"📄 *{barra}garantias* — manda a lista de garantias aos grupos regionais",
         "📡 *​/autenticador* — consulta status de um contrato",
         "🖥️ *​/painel* — endereço do site do painel",
         "🔄 *​/reiniciar* — reinicia a máquina inteira (VPN, bot, site, painel)",
     ]
-    if not whatsapp:
-        linhas.append("⚙️ *​/status* — resumo do sistema e contadores do dia")
+    linhas.append("⚙️ *​/status* — resumo do sistema e contadores do dia")
 
     if monitor_pausado():
         linhas += [
@@ -4484,9 +5692,17 @@ def _painel_tratar_pedido(caminho, corpo_bruto=b""):
             return 409, {"ok": False,
                          "erro": "o bot ainda não carregou a lista de chamados; "
                                  "tente de novo em alguns minutos"}
+        # O site é a terceira porta do backlog, e a trava vale para ela também:
+        # alguém no grupo e alguém no site pedindo ao mesmo tempo é exatamente
+        # o caso que gerava a leva dobrada de imagens.
+        if backlog_em_andamento():
+            return 409, {"ok": False,
+                         "erro": "um backlog já está sendo gerado nesse momento; "
+                                 "aguarde ele terminar"}
         threading.Thread(
-            target=gerar_e_enviar_backlog_todos_tipos,
-            args=(lista,),
+            target=gerar_e_enviar_backlog_travado,
+            args=(gerar_e_enviar_backlog_todos_tipos, lista),
+            kwargs={'destino_whatsapp': BACKLOG_DESTINO},
             daemon=True,
         ).start()
         logger.info("Backlog solicitado pelo site (botão Atualizar).")
@@ -4547,6 +5763,38 @@ def iniciar_ponte_painel():
         logger.warning(f"Não consegui abrir a ponte do painel: {erro}")
     except Exception:
         logger.exception("Erro inesperado na ponte do painel.")
+
+
+def _achatar_comando(palavra):
+    """Reduz uma palavra de comando à forma que a comparação usa: minúscula,
+    sem acento e sem o "s" do plural. Assim "garantias" e "garantia",
+    "termômetro" e "termometro" são a mesma ordem -- ninguém precisa acertar a
+    grafia para o bot obedecer.
+
+    O "s" só cai em palavra com mais de quatro letras, para "help" continuar
+    inteiro. Que "autenticador" vire "radiu" e "status" vire "statu" não importa: os
+    dois lados da comparação passam por aqui, então caem juntos.
+
+    A barra NÃO é achatada. Ela continua separando o que exige barra
+    (/reiniciar, /autenticador, /painel) do que não exige -- sem isso alguém
+    escrevendo "reiniciar" numa conversa normal derrubaria a produção.
+    """
+    palavra = (palavra or "").strip().lower()
+    barra = palavra.startswith("/")
+    corpo = palavra[1:] if barra else palavra
+    corpo = unicodedata.normalize("NFKD", corpo)
+    corpo = "".join(c for c in corpo if not unicodedata.combining(c))
+    if len(corpo) > 4 and corpo.endswith("s"):
+        corpo = corpo[:-1]
+    return ("/" + corpo) if barra else corpo
+
+
+def _comando_bate(comando, *formas):
+    """Diz se o comando digitado é uma das formas aceitas, ignorando acento,
+    maiúscula e plural. Usada nos dois canais para que Telegram e WhatsApp
+    entendam exatamente as mesmas grafias."""
+    alvo = _achatar_comando(comando)
+    return any(alvo == _achatar_comando(forma) for forma in formas)
 
 
 def _obter_texto_comando(mensagem_telegram):
@@ -4623,9 +5871,17 @@ def escutar_comandos_telegram():
                 chat_id_str = str(chat.get("id"))
                 texto_bruto = (mensagem_telegram.get("text") or "").strip()
 
+                # A conversa do /bot e guardada por PESSOA, nao pelo grupo: o
+                # WhatsApp ja fazia assim (a chave la e o JID de quem falou), e
+                # no Telegram guardar pelo grupo faria o "bom dia" de outra
+                # pessoa ser engolido como resposta a pergunta que o bot fez
+                # para alguem. Comando de controle segue por grupo, como era.
+                autor_telegram = str((mensagem_telegram.get("from") or {}).get("id") or "")
+                chave_conversa = f"{chat_id_str}:{autor_telegram}"
+
                 comando = _obter_texto_comando(mensagem_telegram)
 
-                if comando in ("/comandos", "/ajuda", "/help"):
+                if _comando_bate(comando, "/comandos", "/ajuda", "/help"):
                     logger.info("Comando /comandos recebido no grupo.")
                     try:
                         enviar_alerta_telegram(montar_mensagem_comandos())
@@ -4633,7 +5889,7 @@ def escutar_comandos_telegram():
                         logger.exception("Falha ao enviar a lista de comandos.")
                     continue
 
-                if comando == "/reiniciar":
+                if _comando_bate(comando, "/reiniciar"):
                     if _reiniciar_em_andamento.is_set():
                         enviar_alerta_telegram("🔄 Já estou reiniciando o sistema — aguarde.")
                     else:
@@ -4646,7 +5902,7 @@ def escutar_comandos_telegram():
                         threading.Thread(target=_reiniciar_sistema_thread, daemon=True).start()
                     continue
 
-                if comando == "/status":
+                if _comando_bate(comando, "/status"):
                     logger.info("Comando /status recebido no grupo. Enviando resumo do sistema...")
                     try:
                         enviar_status_telegram()
@@ -4654,8 +5910,8 @@ def escutar_comandos_telegram():
                         logger.exception("Falha ao montar/enviar o resumo do comando /status.")
                     continue
 
-                if comando in ("/exibirpaineltv", "/ocultarpaineltv"):
-                    exibir = comando == "/exibirpaineltv"
+                if _comando_bate(comando, "/exibirpaineltv", "/ocultarpaineltv"):
+                    exibir = _comando_bate(comando, "/exibirpaineltv")
                     if exibir == painel_tv_pedido():
                         enviar_alerta_telegram(
                             "📺 O painel de TV já está " + ("aberto." if exibir else "fechado.")
@@ -4672,8 +5928,8 @@ def escutar_comandos_telegram():
                         enviar_alerta_telegram("📺 Fechando o painel de TV.")
                     continue
 
-                if comando in ("/exibirnavegador", "/ocultarnavegador"):
-                    exibir = comando == "/exibirnavegador"
+                if _comando_bate(comando, "/exibirnavegador", "/ocultarnavegador"):
+                    exibir = _comando_bate(comando, "/exibirnavegador")
                     if exibir == navegador_deve_aparecer():
                         enviar_alerta_telegram(
                             "🖥️ O navegador já está " + ("à vista." if exibir else "oculto.")
@@ -4690,7 +5946,7 @@ def escutar_comandos_telegram():
                         )
                     continue
 
-                if comando == "/desligar":
+                if _comando_bate(comando, "/desligar"):
                     if pausar_monitor():
                         logger.warning("Comando /desligar recebido no grupo (Telegram). Pausando o monitoramento.")
                         enviar_alerta_telegram(
@@ -4702,7 +5958,7 @@ def escutar_comandos_telegram():
                         enviar_alerta_telegram("🌙 O monitoramento já está pausado. Use /ligar para retomar.")
                     continue
 
-                if comando == "/ligar":
+                if _comando_bate(comando, "/ligar"):
                     if retomar_monitor():
                         logger.warning("Comando /ligar recebido no grupo (Telegram). Retomando o monitoramento.")
                         enviar_alerta_telegram(
@@ -4715,7 +5971,7 @@ def escutar_comandos_telegram():
                     continue
 
                 # ============ NOVO: endereço do painel (sobe o site se preciso) ============
-                if comando == "/painel":
+                if _comando_bate(comando, "/painel"):
                     logger.info("Comando /painel recebido no grupo.")
                     threading.Thread(
                         target=lambda: enviar_alerta_telegram(montar_mensagem_painel()),
@@ -4723,23 +5979,40 @@ def escutar_comandos_telegram():
                     ).start()
                     continue
 
-                if comando == "/autenticador":
+                if _comando_bate(comando, "/autenticador"):
                     logger.info("Comando /autenticador recebido no grupo. Aguardando contrato...")
                     AGUARDANDO_CONTRATO_AUTENTICADOR[chat_id_str] = time.time()
                     enviar_alerta_telegram("📡 Digite o contrato para consultar no Autenticador:")
                     continue
 
                 # ============ MODIFICADO: suporte a subcomandos /backlog ============
-                if comando.startswith("/backlog"):
+                if _comando_bate(comando, "/backlog"):
+                    if backlog_em_andamento():
+                        enviar_alerta_telegram(AVISO_BACKLOG_EM_ANDAMENTO)
+                        continue
                     partes = texto_bruto.split(maxsplit=1)
                     subtipo = partes[1].strip().lower() if len(partes) > 1 else None
+                    # O tipo digitado passa pelo mesmo achatamento do comando:
+                    # "reparos", "REPARO" e "mudança_cômodo" chegam todos ao
+                    # nome que a lista guarda.
+                    if subtipo is not None:
+                        subtipo = next(
+                            (t for t in TIPOS_BACKLOG_VALIDOS
+                             if _achatar_comando(t) == _achatar_comando(subtipo)),
+                            subtipo,
+                        )
 
                     if subtipo is None:
                         # Nenhum tipo informado ("/backlog" sozinho) -> envia TODOS os tipos
-                        enviar_alerta_telegram("⏳ Gerando backlog completo (todos os tipos), aguarde...")
+                        enviar_alerta_telegram(
+                            "⏳ Gerando backlog completo (todos os tipos), aguarde...\n"
+                            f"As imagens saem no grupo *{BACKLOG_NOME_DESTINO}*."
+                        )
                         threading.Thread(
-                            target=gerar_e_enviar_backlog_todos_tipos,
-                            args=(obter_lista_chamados_atual(),),
+                            target=gerar_e_enviar_backlog_travado,
+                            args=(gerar_e_enviar_backlog_todos_tipos,
+                                  obter_lista_chamados_atual()),
+                            kwargs={'destino_whatsapp': BACKLOG_DESTINO},
                             daemon=True,
                         ).start()
                         continue
@@ -4751,16 +6024,21 @@ def escutar_comandos_telegram():
                         )
                         continue
 
-                    enviar_alerta_telegram(f"⏳ Gerando backlog de {subtipo}, aguarde...")
+                    enviar_alerta_telegram(
+                        f"⏳ Gerando backlog de {subtipo}, aguarde...\n"
+                        f"A imagem sai no grupo *{BACKLOG_NOME_DESTINO}*."
+                    )
                     threading.Thread(
-                        target=gerar_e_enviar_backlog_tipo,
-                        args=(obter_lista_chamados_atual(), subtipo),
+                        target=gerar_e_enviar_backlog_travado,
+                        args=(gerar_e_enviar_backlog_tipo,
+                              obter_lista_chamados_atual(), subtipo),
+                        kwargs={'destino_whatsapp': BACKLOG_DESTINO},
                         daemon=True,
                     ).start()
                     continue
 
                 # ============ NOVO: termômetro de entrantes CAPEX ============
-                if comando == "/termometro":
+                if _comando_bate(comando, "/termometro"):
                     enviar_alerta_telegram("⏳ Gerando termômetro de entrantes CAPEX, aguarde...")
                     threading.Thread(
                         target=gerar_e_enviar_termometro_capex,
@@ -4769,7 +6047,7 @@ def escutar_comandos_telegram():
                     continue
 
                 # ============ NOVO (13/08/2026): reincidentes em aberto ============
-                if comando == "/improdutivas":
+                if _comando_bate(comando, "/improdutivas"):
                     logger.info("Comando /improdutivas recebido. Montando a lista consolidada...")
                     enviar_alerta_telegram("⏳ Levantando as improdutivas reincidentes em aberto...")
                     threading.Thread(
@@ -4779,8 +6057,52 @@ def escutar_comandos_telegram():
                     ).start()
                     continue
 
+                # ============ NOVO (28/08/2026): área de risco em aberto ============
+                if _comando_bate(comando, "/risco", "/areaderisco"):
+                    logger.info("Comando /risco recebido. Montando a lista de área de risco...")
+                    enviar_alerta_telegram("⏳ Levantando os CAPEX abertos em área de risco...")
+                    threading.Thread(
+                        target=responder_area_risco,
+                        kwargs={'whatsapp': False},
+                        daemon=True,
+                    ).start()
+                    continue
+
                 # ============ NOVO (13/08/2026): a lista de garantias, fora de hora ============
-                if comando == "/garantias":
+                if _comando_bate(comando, "/bot"):
+                    partes = texto_bruto.split(maxsplit=1)
+                    pergunta = partes[1].strip() if len(partes) > 1 else ""
+                    if not assistente_ia.disponivel():
+                        enviar_alerta_telegram(
+                            "⚠️ O /bot está sem chave de IA configurada no "
+                            "servidor. Os outros comandos seguem normais."
+                        )
+                        continue
+                    logger.info(f"Comando /bot recebido: {pergunta[:120]!r}")
+                    # /bot começa conversa nova: o que estava pendente
+                    # morre aqui, senão a pergunta nova seria lida como
+                    # réplica da anterior.
+                    AGUARDANDO_RESPOSTA_BOT.pop(chave_conversa, None)
+                    enviar_alerta_telegram("⏳ Pensando...")
+                    threading.Thread(
+                        target=responder_pergunta_bot,
+                        args=(pergunta,),
+                        kwargs={'whatsapp': False, 'chave': chave_conversa},
+                        daemon=True,
+                    ).start()
+                    continue
+
+                if _comando_bate(comando, "/carga", "/previa"):
+                    logger.info("Comando /carga recebido no Telegram.")
+                    enviar_alerta_telegram("⏳ Montando a prévia da carga (atualizo a base no OFS antes de contar, leva alguns segundos)...")
+                    threading.Thread(
+                        target=gerar_e_enviar_carga,
+                        kwargs={'whatsapp': False},
+                        daemon=True,
+                    ).start()
+                    continue
+
+                if _comando_bate(comando, "/garantias"):
                     enviar_alerta_telegram(
                         "⏳ Gerando a lista de garantias e mandando para os grupos regionais..."
                     )
@@ -4790,7 +6112,34 @@ def escutar_comandos_telegram():
                     ).start()
                     continue
 
+                if _comando_bate(comando, "/alertas"):
+                    logger.info("Comando /alertas recebido no Telegram.")
+                    _alertas_tratar_comando(
+                        texto_bruto, autor_telegram or 'Telegram',
+                        enviar_alerta_telegram,
+                        lambda: AGUARDANDO_REGIAO_ALERTAS.__setitem__(
+                            chave_conversa, time.time()),
+                    )
+                    continue
+
                 if texto_bruto and not texto_bruto.startswith("/"):
+                    ts_alertas = AGUARDANDO_REGIAO_ALERTAS.get(chave_conversa)
+                    if ts_alertas is not None:
+                        if _alertas_tratar_resposta(
+                                texto_bruto, ts_alertas,
+                                autor_telegram or 'Telegram',
+                                enviar_alerta_telegram):
+                            AGUARDANDO_REGIAO_ALERTAS.pop(chave_conversa, None)
+                            continue
+
+                    # O /autenticador vem primeiro por ser mais específico: quem
+                    # acabou de pedir contrato está digitando um número, não
+                    # conversando com a IA.
+                    if AGUARDANDO_CONTRATO_AUTENTICADOR.get(chat_id_str) is None:
+                        if continuar_conversa_bot(chave_conversa, texto_bruto,
+                                                  whatsapp=False):
+                            continue
+
                     ts_prompt = AGUARDANDO_CONTRATO_AUTENTICADOR.get(chat_id_str)
                     if ts_prompt is not None:
                         AGUARDANDO_CONTRATO_AUTENTICADOR.pop(chat_id_str, None)
@@ -4812,6 +6161,69 @@ def escutar_comandos_telegram():
         except Exception:
             logger.exception("Erro inesperado na thread de escuta de comandos do Telegram.")
             time.sleep(5)
+
+
+# ============ /alertas: Upgrade e Mudança de cômodo, por região ============
+# A regra e o estado moram no alertas_opcionais.py. Aqui fica só a conversa:
+# mostrar o menu, ler a resposta e confirmar.
+
+
+def _alertas_aplicar_escolha(regiao, quem, responder):
+    """Grava a escolha e responde ao grupo. Devolve se conseguiu gravar.
+
+    Falha ao gravar é dita em voz alta, e não em silêncio: quem digitou "1"
+    precisa saber que o alerta NÃO foi ligado, senão fica esperando um aviso
+    que nunca vem.
+    """
+    try:
+        estado = alertas_opcionais.gravar(regiao, por=quem)
+    except Exception:
+        logger.exception("Falha ao gravar a escolha do /alertas.")
+        responder("⚠️ Não consegui gravar a escolha. *Nada mudou* — "
+                  "tente de novo com */alertas*.")
+        return False
+    responder(alertas_opcionais.texto_confirmacao(estado))
+    return True
+
+
+def _alertas_tratar_comando(texto_bruto, quem, responder, marcar_espera):
+    """Trata o /alertas nos dois canais.
+
+    Aceita a escolha na mesma linha ("/alertas rj") e também sozinho, abrindo o
+    menu. A forma direta existe porque quem já sabe o que quer não deveria
+    precisar de duas mensagens; o menu existe porque quem não sabe precisa ver
+    as opções.
+    """
+    partes = texto_bruto.split(maxsplit=1)
+    resto = partes[1].strip() if len(partes) > 1 else ''
+    if resto:
+        regiao = alertas_opcionais.interpretar(resto)
+        if regiao is None:
+            responder("⚠️ Não entendi *%s*.\n\n%s"
+                      % (resto, alertas_opcionais.texto_menu(
+                          alertas_opcionais.carregar())))
+            marcar_espera()
+            return
+        _alertas_aplicar_escolha(regiao, quem, responder)
+        return
+
+    responder(alertas_opcionais.texto_menu(alertas_opcionais.carregar()))
+    marcar_espera()
+
+
+def _alertas_tratar_resposta(texto_bruto, ts_prompt, quem, responder):
+    """A resposta do operador ao menu. Devolve se ela foi consumida aqui."""
+    if (time.time() - ts_prompt) > TIMEOUT_AGUARDANDO_REGIAO_ALERTAS_SEG:
+        responder("⏱️ Tempo para escolher a região expirou. "
+                  "Mande */alertas* de novo.")
+        return True
+    regiao = alertas_opcionais.interpretar(texto_bruto)
+    if regiao is None:
+        # Não é uma escolha: quem falou mudou de assunto. Devolver o menu aqui
+        # transformaria qualquer conversa do grupo em erro repetido.
+        return False
+    _alertas_aplicar_escolha(regiao, quem, responder)
+    return True
 
 
 def _obter_comando_whatsapp(texto):
@@ -4844,6 +6256,173 @@ def escutar_comandos_whatsapp():
                 if not remetente or (not texto_bruto and not arquivo):
                     continue
 
+                # ---------------------------------------- conversa privada
+                # No privado não existe comando: tudo o que chega é pergunta
+                # para a IA. Quem escreve para o bot no particular já está
+                # falando com ele, e exigir "/bot" ali seria protocolo por
+                # protocolo.
+                #
+                # A porta é fechada por JID. Sem BOT_PV_LIBERADOS preenchido,
+                # nada é respondido -- e o número de quem tentou fica no log,
+                # que é como se descobre o JID para liberar.
+                # ---------------------------------------- de onde veio, para onde volta
+                # `destino_resposta` vazio quer dizer "o grupo de comandos",
+                # que é o padrão de sempre. Preenchido, é o JID de quem falou
+                # no privado -- e daí toda resposta desta mensagem volta para
+                # lá, inclusive as que uma thread manda minutos depois.
+                privado = bool(msg.get("privado"))
+                conversa = msg.get("conversa") or remetente
+                destino_resposta = conversa if privado else None
+                # A chave que identifica a conversa nos dicionários de espera
+                # (/autenticador aguardando contrato, pergunta aberta com a IA). No
+                # grupo é o participante, porque várias pessoas falam ali; no
+                # privado é a conversa, que é a mesma coisa e não muda quando o
+                # WhatsApp entrega o `@lid` no lugar do número.
+                chave_conversa = conversa if privado else remetente
+
+                if privado:
+                    numero = _so_numero_jid(conversa)
+                    if numero not in BOT_PV_LIBERADOS:
+                        logger.info(
+                            "Conversa privada ignorada: %s não está em "
+                            "BOT_PV_LIBERADOS. Para liberar, ponha este "
+                            "número na variável.", numero or "(sem número)")
+                        continue
+                    if arquivo:
+                        continue
+                    logger.info("Mensagem no privado de %s: %s",
+                                numero, texto_bruto[:80])
+
+                    # Guarda o JID INTEIRO desta conversa. É o que permite o bot
+                    # avisar aqui depois, sem construir `@lid` na mão -- ver
+                    # ofs_extracao.lembrar_pv.
+                    try:
+                        ofs_extracao.lembrar_pv(conversa)
+                    except Exception:
+                        logger.exception("Falha ao guardar o JID do privado.")
+
+                    # Quem acabou de pedir /autenticador está digitando um número de
+                    # contrato, não conversando com a IA. Este ramo vem antes
+                    # por isso, e é o mesmo cuidado que o grupo já tem.
+                    esperando_autenticador = (
+                        AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP.get(chave_conversa)
+                        is not None)
+
+                    if not texto_bruto.startswith("/") and not esperando_autenticador:
+                        # A réplica de uma pergunta que o bot fez vem sem nada
+                        # na frente, e tem de continuar a MESMA conversa.
+                        if continuar_conversa_bot(conversa, texto_bruto,
+                                                  whatsapp=True,
+                                                  destino=conversa):
+                            continue
+
+                    if not texto_bruto.startswith("/"):
+                        # No privado, texto solto é pergunta para a IA -- quem
+                        # escreve para o bot no particular já está falando com
+                        # ele. Comando exige a BARRA, e isso é regra: "desligar"
+                        # no meio de uma frase ("vou desligar o computador")
+                        # calaria os alertas da operação inteira.
+                        if esperando_autenticador:
+                            AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP.pop(
+                                chave_conversa, None)
+                            try:
+                                processar_consulta_autenticador_whatsapp(
+                                    texto_bruto, destino=conversa)
+                            except Exception:
+                                logger.exception(
+                                    "Falha ao processar consulta do /autenticador no privado.")
+                                enviar_alerta_whatsapp_grupo(
+                                    "⚠️ Erro inesperado ao consultar o Autenticador. "
+                                    "Tente novamente com /autenticador.",
+                                    destino=conversa)
+                            continue
+
+                        pergunta = texto_bruto
+                        AGUARDANDO_RESPOSTA_BOT_WHATSAPP.pop(conversa, None)
+                        enviar_alerta_whatsapp_grupo("⏳ Pensando...",
+                                                     destino=conversa)
+                        threading.Thread(
+                            target=responder_pergunta_bot,
+                            args=(pergunta,),
+                            kwargs={'whatsapp': True, 'chave': conversa,
+                                    'destino': conversa},
+                            daemon=True,
+                        ).start()
+                        continue
+
+                    # Começou com barra: NÃO trata aqui. Cai no mesmo despacho
+                    # de comandos do grupo, lá embaixo, que já sabe responder
+                    # para `destino_resposta`. É o que evita duas listas de
+                    # comandos vivendo em lugares diferentes.
+
+                # ------------------------------------- grupo que não é o de comando
+                # Os grupos de região (Controle de rota e <grupo do RJ>)
+                # passaram a ser escutados, mas ali vale o /bot e NADA MAIS.
+                #
+                # A separação é deliberada. Naqueles grupos está a operação
+                # inteira, incluindo gente de fora da nossa equipe, e
+                # /reiniciar derruba a máquina, /desligar cala os alertas.
+                # Uma pergunta errada custa uma resposta errada; um
+                # /reiniciar errado custa a produção. Comando de controle
+                # continua morando num grupo só, que é onde ele sempre morou.
+                if not privado and not msg.get("principal"):
+                    if arquivo:
+                        continue
+
+                    # O `comando` do laco principal so e calculado mais
+                    # abaixo. Este bloco vem ANTES dele de proposito -- o
+                    # grupo de regiao nao pode cair nos comandos de controle
+                    # --, entao ele calcula o seu proprio.
+                    #
+                    # Usar a variavel de baixo aqui levantou UnboundLocalError
+                    # em producao no primeiro teste, as 15:31 de 31/08/2026.
+                    # E a excecao nao errou so aquela mensagem: ela derrubou o
+                    # laco, e a fila do Node e de consumo unico, entao o resto
+                    # do lote foi descartado em silencio.
+                    comando_grupo = _obter_comando_whatsapp(texto_bruto)
+
+                    # A prévia da carga é justamente a visão que estes grupos
+                    # usam para montar rota, então ela vale aqui -- e sai no
+                    # grupo que pediu, não no principal.
+                    if _comando_bate(comando_grupo, "carga", "/carga",
+                                     "previa", "/previa"):
+                        logger.info("/carga pedido no grupo %s.", conversa)
+                        enviar_alerta_whatsapp_grupo("⏳ Montando a prévia da carga (atualizo a base no OFS antes de contar, leva alguns segundos)...",
+                                                     destino=conversa)
+                        threading.Thread(
+                            target=gerar_e_enviar_carga,
+                            kwargs={'telegram': False,
+                                    'destino_whatsapp': conversa},
+                            daemon=True,
+                        ).start()
+                        continue
+
+                    # A réplica a uma pergunta que o bot fez vem sem /bot na
+                    # frente. A chave é o grupo, então duas regiões podem ter
+                    # conversas abertas ao mesmo tempo sem se misturarem.
+                    if continuar_conversa_bot(conversa, texto_bruto,
+                                              whatsapp=True, destino=conversa):
+                        continue
+
+                    if not _comando_bate(comando_grupo, "/bot", "bot"):
+                        continue
+
+                    pergunta = texto_bruto[4:].strip() if len(texto_bruto) > 4 \
+                        else ''
+                    logger.info("/bot pedido no grupo %s: %s",
+                                conversa, (pergunta or "(sem pergunta)")[:80])
+                    AGUARDANDO_RESPOSTA_BOT_WHATSAPP.pop(conversa, None)
+                    enviar_alerta_whatsapp_grupo("⏳ Pensando...",
+                                                 destino=conversa)
+                    threading.Thread(
+                        target=responder_pergunta_bot,
+                        args=(pergunta,),
+                        kwargs={'whatsapp': True, 'chave': conversa,
+                                'destino': conversa},
+                        daemon=True,
+                    ).start()
+                    continue
+
                 # Anexo no grupo não é mais assunto do bot. O único comando que
                 # esperava arquivo era o /improdutivas antigo, de lote; o
                 # /improdutivas de hoje lê o CAMPO e não quer anexo nenhum. As
@@ -4853,59 +6432,81 @@ def escutar_comandos_whatsapp():
                 if arquivo:
                     continue
 
+                # Daqui para baixo é o despacho de comandos, e ele é UM só: o
+                # grupo de comandos e a conversa privada liberada passam pelo
+                # mesmo código. O que muda entre os dois é só para onde a
+                # resposta volta.
+                #
+                # Duas listas de comandos divergiriam no primeiro comando novo
+                # -- alguém acrescentaria num lugar e esqueceria no outro, e o
+                # comando "sumiria" no privado sem erro nenhum.
+                _responder = functools.partial(enviar_alerta_whatsapp_grupo,
+                                               destino=destino_resposta)
+
                 comando = _obter_comando_whatsapp(texto_bruto)
 
-                if comando in ("/comandos", "comandos", "/ajuda", "ajuda", "/help"):
+                if _comando_bate(comando, "/comandos", "comandos", "/ajuda", "ajuda", "/help"):
                     logger.info("Comando /comandos recebido no grupo do WhatsApp.")
                     try:
-                        enviar_alerta_whatsapp_grupo(montar_mensagem_comandos(whatsapp=True))
+                        _responder(montar_mensagem_comandos(whatsapp=True))
                     except Exception:
                         logger.exception("Falha ao enviar a lista de comandos no WhatsApp.")
                     continue
 
-                if comando == "/reiniciar":
+                if _comando_bate(comando, "/reiniciar"):
                     if _reiniciar_em_andamento.is_set():
-                        enviar_alerta_whatsapp_grupo("🔄 Já estou reiniciando o sistema — aguarde.")
+                        _responder("🔄 Já estou reiniciando o sistema — aguarde.")
                     else:
                         _reiniciar_em_andamento.set()
                         logger.warning("Comando '/reiniciar' recebido no grupo do WhatsApp. Reiniciando o sistema.")
-                        enviar_alerta_whatsapp_grupo(
+                        _responder(
                             "🔄 *Reiniciando o sistema todo.* VPN, bot, site e painel de TV "
                             "voltam sozinhos em 1-2 minutos."
                         )
                         threading.Thread(target=_reiniciar_sistema_thread, daemon=True).start()
                     continue
 
-                if comando in ("/exibirpaineltv", "exibirpaineltv",
-                               "/ocultarpaineltv", "ocultarpaineltv"):
-                    exibir = comando.lstrip("/") == "exibirpaineltv"
+                # O /status existia só no Telegram até 25/08/2026, e digitar
+                # ele aqui não dava resposta nenhuma -- silêncio que parece bot
+                # morto. O resumo é o mesmo dos dois lados.
+                if _comando_bate(comando, "/status"):
+                    logger.info("Comando /status recebido no grupo do WhatsApp. Enviando resumo do sistema...")
+                    try:
+                        _responder(montar_mensagem_status())
+                    except Exception:
+                        logger.exception("Falha ao montar/enviar o resumo do comando /status no WhatsApp.")
+                    continue
+
+                if _comando_bate(comando, "/exibirpaineltv", "exibirpaineltv",
+                                          "/ocultarpaineltv", "ocultarpaineltv"):
+                    exibir = _comando_bate(comando, "exibirpaineltv", "/exibirpaineltv")
                     if exibir == painel_tv_pedido():
-                        enviar_alerta_whatsapp_grupo(
+                        _responder(
                             "📺 O painel de TV já está " + ("aberto." if exibir else "fechado.")
                         )
                     elif exibir:
                         _painel_tv_pedido.set()
                         logger.warning("Comando 'exibirpaineltv' recebido no grupo do WhatsApp.")
-                        enviar_alerta_whatsapp_grupo(
+                        _responder(
                             "📺 Abrindo o painel de TV na máquina. O navegador continua oculto."
                         )
                     else:
                         _painel_tv_pedido.clear()
                         logger.warning("Comando 'ocultarpaineltv' recebido no grupo do WhatsApp.")
-                        enviar_alerta_whatsapp_grupo("📺 Fechando o painel de TV.")
+                        _responder("📺 Fechando o painel de TV.")
                     continue
 
-                if comando in ("/exibirnavegador", "exibirnavegador",
-                               "/ocultarnavegador", "ocultarnavegador"):
-                    exibir = comando.lstrip("/") == "exibirnavegador"
+                if _comando_bate(comando, "/exibirnavegador", "exibirnavegador",
+                                          "/ocultarnavegador", "ocultarnavegador"):
+                    exibir = _comando_bate(comando, "exibirnavegador", "/exibirnavegador")
                     if exibir == navegador_deve_aparecer():
-                        enviar_alerta_whatsapp_grupo(
+                        _responder(
                             "🖥️ O navegador já está " + ("à vista." if exibir else "oculto.")
                         )
                     else:
                         _navegador_visivel.set() if exibir else _navegador_visivel.clear()
                         logger.warning(f"Comando '{comando}' recebido no grupo do WhatsApp.")
-                        enviar_alerta_whatsapp_grupo(
+                        _responder(
                             ("🖥️ Reabrindo o navegador *à vista* na máquina."
                              if exibir else
                              "🖥️ Voltando o navegador para o modo oculto.")
@@ -4914,78 +6515,115 @@ def escutar_comandos_whatsapp():
                         )
                     continue
 
-                if comando in ("/desligar", "desligar"):
+                if _comando_bate(comando, "/desligar", "desligar"):
                     if pausar_monitor():
                         logger.warning("Comando 'desligar' recebido no grupo do WhatsApp. Pausando o monitoramento.")
-                        enviar_alerta_whatsapp_grupo(
+                        _responder(
                             "🌙 *Monitoramento pausado.*\n"
                             "O navegador vai fechar e nenhum alerta será enviado.\n"
                             "Digite *ligar* para retomar."
                         )
                     else:
-                        enviar_alerta_whatsapp_grupo("🌙 O monitoramento já está pausado. Digite *ligar* para retomar.")
+                        _responder("🌙 O monitoramento já está pausado. Digite *ligar* para retomar.")
                     continue
 
-                if comando in ("/ligar", "ligar"):
+                if _comando_bate(comando, "/ligar", "ligar"):
                     if retomar_monitor():
                         logger.warning("Comando 'ligar' recebido no grupo do WhatsApp. Retomando o monitoramento.")
-                        enviar_alerta_whatsapp_grupo(
+                        _responder(
                             "☀️ *Retomando o monitoramento.*\n"
                             "Abrindo o navegador e refazendo o login — a varredura "
                             "volta ao normal em cerca de 1 minuto."
                         )
                     else:
-                        enviar_alerta_whatsapp_grupo("☀️ O monitoramento já está rodando.")
+                        _responder("☀️ O monitoramento já está rodando.")
                     continue
 
-                if comando == "/autenticador":
+                if _comando_bate(comando, "/autenticador"):
                     logger.info("Comando /autenticador recebido no grupo do WhatsApp. Aguardando contrato...")
-                    AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP[remetente] = time.time()
-                    enviar_alerta_whatsapp_grupo("📡 Digite o contrato para consultar no Autenticador:")
+                    AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP[chave_conversa] = time.time()
+                    _responder("📡 Digite o contrato para consultar no Autenticador:")
                     continue
 
                 # ============ NOVO: endereço do painel (sobe o site se preciso) ============
-                if comando == "/painel":
+                if _comando_bate(comando, "/painel"):
                     logger.info("Comando /painel recebido no grupo do WhatsApp.")
                     threading.Thread(
-                        target=lambda: enviar_alerta_whatsapp_grupo(montar_mensagem_painel()),
+                        target=lambda: _responder(montar_mensagem_painel()),
                         daemon=True,
                     ).start()
                     continue
 
                 # ============ MODIFICADO: suporte a subcomandos "backlog" ============
-                if comando == "backlog":
+                if _comando_bate(comando, "backlog", "/backlog"):
+                    if backlog_em_andamento():
+                        _responder(AVISO_BACKLOG_EM_ANDAMENTO)
+                        continue
                     partes = texto_bruto.split(maxsplit=1)
                     subtipo = partes[1].strip().lower() if len(partes) > 1 else None
+                    # O tipo digitado passa pelo mesmo achatamento do comando:
+                    # "reparos", "REPARO" e "mudança_cômodo" chegam todos ao
+                    # nome que a lista guarda.
+                    if subtipo is not None:
+                        subtipo = next(
+                            (t for t in TIPOS_BACKLOG_VALIDOS
+                             if _achatar_comando(t) == _achatar_comando(subtipo)),
+                            subtipo,
+                        )
 
                     if subtipo is None:
                         # Nenhum tipo informado ("backlog" sozinho) -> envia TODOS os tipos
-                        enviar_alerta_whatsapp_grupo("⏳ Gerando backlog completo (todos os tipos), aguarde...")
+                        _responder(
+                            "⏳ Gerando backlog completo (todos os tipos), aguarde...\n"
+                            f"As imagens saem no grupo *{BACKLOG_NOME_DESTINO}*."
+                        )
                         threading.Thread(
-                            target=gerar_e_enviar_backlog_todos_tipos,
-                            args=(obter_lista_chamados_atual(),),
+                            target=gerar_e_enviar_backlog_travado,
+                            args=(gerar_e_enviar_backlog_todos_tipos,
+                                  obter_lista_chamados_atual()),
+                            kwargs={'destino_whatsapp': BACKLOG_DESTINO},
                             daemon=True,
                         ).start()
                         continue
 
                     if subtipo not in TIPOS_BACKLOG_VALIDOS:
-                        enviar_alerta_whatsapp_grupo(
+                        _responder(
                             f"⚠️ Tipo inválido. Use: backlog {', '.join(TIPOS_BACKLOG_VALIDOS)}\n"
                             f"Exemplo: backlog reparo"
                         )
                         continue
 
-                    enviar_alerta_whatsapp_grupo(f"⏳ Gerando backlog de {subtipo}, aguarde...")
+                    _responder(
+                        f"⏳ Gerando backlog de {subtipo}, aguarde...\n"
+                        f"A imagem sai no grupo *{BACKLOG_NOME_DESTINO}*."
+                    )
                     threading.Thread(
-                        target=gerar_e_enviar_backlog_tipo,
-                        args=(obter_lista_chamados_atual(), subtipo),
+                        target=gerar_e_enviar_backlog_travado,
+                        args=(gerar_e_enviar_backlog_tipo,
+                              obter_lista_chamados_atual(), subtipo),
+                        kwargs={'destino_whatsapp': BACKLOG_DESTINO},
+                        daemon=True,
+                    ).start()
+                    continue
+
+                # ====== NOVO (31/08/2026): a prévia da carga do dia seguinte ======
+                # Com e sem barra, como o /improdutivas e o /risco: é comando
+                # que a operação digita todo fim de tarde, e exigir a barra só
+                # produziria mensagem sem resposta.
+                if _comando_bate(comando, "carga", "/carga", "previa", "/previa"):
+                    logger.info("Comando /carga recebido no grupo do WhatsApp.")
+                    _responder("⏳ Montando a prévia da carga (atualizo a base no OFS antes de contar, leva alguns segundos)...")
+                    threading.Thread(
+                        target=gerar_e_enviar_carga,
+                        kwargs={'telegram': False,
+                                'destino_whatsapp': destino_resposta},
                         daemon=True,
                     ).start()
                     continue
 
                 # ============ NOVO: termômetro de entrantes CAPEX ============
-                if comando == "termometro":
-                    enviar_alerta_whatsapp_grupo("⏳ Gerando termômetro de entrantes CAPEX, aguarde...")
+                if _comando_bate(comando, "termometro", "/termometro"):
+                    _responder("⏳ Gerando termômetro de entrantes CAPEX, aguarde...")
                     threading.Thread(
                         target=gerar_e_enviar_termometro_capex,
                         daemon=True,
@@ -4996,19 +6634,66 @@ def escutar_comandos_whatsapp():
                 # Aceita com e sem barra: no WhatsApp os outros comandos são
                 # escritos sem ela, mas "/improdutivas" é como este comando
                 # sempre foi chamado e é o que a operação vai digitar.
-                if comando in ("improdutivas", "/improdutivas"):
+                if _comando_bate(comando, "improdutivas", "/improdutivas"):
                     logger.info("Comando /improdutivas recebido no grupo do WhatsApp.")
-                    enviar_alerta_whatsapp_grupo("⏳ Levantando as improdutivas reincidentes em aberto...")
+                    _responder("⏳ Levantando as improdutivas reincidentes em aberto...")
                     threading.Thread(
                         target=responder_improdutivas,
-                        kwargs={'whatsapp': True},
+                        kwargs={'whatsapp': True, 'destino': destino_resposta},
+                        daemon=True,
+                    ).start()
+                    continue
+
+                # ============ NOVO (28/08/2026): área de risco em aberto ============
+                # Com e sem barra, pela mesma razão do /improdutivas.
+                if _comando_bate(comando, "risco", "/risco", "areaderisco", "/areaderisco"):
+                    logger.info("Comando /risco recebido no grupo do WhatsApp.")
+                    _responder("⏳ Levantando os CAPEX abertos em área de risco...")
+                    threading.Thread(
+                        target=responder_area_risco,
+                        kwargs={'whatsapp': True, 'destino': destino_resposta},
                         daemon=True,
                     ).start()
                     continue
 
                 # ============ NOVO (13/08/2026): a lista de garantias, fora de hora ============
-                if comando in ("garantias", "/garantias"):
-                    enviar_alerta_whatsapp_grupo(
+                # Só com barra, ao contrário dos outros comandos do WhatsApp:
+                # "bot" solto é palavra comum na conversa do grupo ("o bot caiu"),
+                # e cada disparo à toa gasta cota da IA.
+                if _comando_bate(comando, "/bot"):
+                    partes = texto_bruto.split(maxsplit=1)
+                    pergunta = partes[1].strip() if len(partes) > 1 else ""
+                    if not assistente_ia.disponivel():
+                        _responder(
+                            "⚠️ O /bot está sem chave de IA configurada no "
+                            "servidor. Os outros comandos seguem normais."
+                        )
+                        continue
+                    logger.info(f"Comando /bot (WhatsApp) recebido: {pergunta[:120]!r}")
+                    AGUARDANDO_RESPOSTA_BOT_WHATSAPP.pop(chave_conversa, None)
+                    _responder("⏳ Pensando...")
+                    threading.Thread(
+                        target=responder_pergunta_bot,
+                        args=(pergunta,),
+                        kwargs={'whatsapp': True, 'chave': chave_conversa,
+                                'destino': destino_resposta},
+                        daemon=True,
+                    ).start()
+                    continue
+
+                if _comando_bate(comando, "alertas", "/alertas"):
+                    logger.info("Comando /alertas recebido no WhatsApp.")
+                    _alertas_tratar_comando(
+                        texto_bruto,
+                        _so_numero_jid(remetente) or remetente,
+                        _responder,
+                        lambda: AGUARDANDO_REGIAO_ALERTAS.__setitem__(
+                            chave_conversa, time.time()),
+                    )
+                    continue
+
+                if _comando_bate(comando, "garantias", "/garantias"):
+                    _responder(
                         "⏳ Gerando a lista de garantias e mandando para os grupos regionais..."
                     )
                     threading.Thread(
@@ -5018,17 +6703,37 @@ def escutar_comandos_whatsapp():
                     continue
 
                 if not texto_bruto.startswith("/"):
-                    ts_prompt = AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP.get(remetente)
+                    # A escolha da região vem antes da IA pela mesma razão do
+                    # /autenticador: quem acabou de ver o menu está respondendo "1",
+                    # não conversando.
+                    ts_alertas = AGUARDANDO_REGIAO_ALERTAS.get(chave_conversa)
+                    if ts_alertas is not None:
+                        if _alertas_tratar_resposta(
+                                texto_bruto, ts_alertas,
+                                _so_numero_jid(remetente) or remetente,
+                                _responder):
+                            AGUARDANDO_REGIAO_ALERTAS.pop(chave_conversa, None)
+                            continue
+
+                    if AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP.get(chave_conversa) is None:
+                        if continuar_conversa_bot(chave_conversa, texto_bruto,
+                                                  whatsapp=True,
+                                                  destino=destino_resposta):
+                            continue
+
+                    ts_prompt = AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP.get(chave_conversa)
                     if ts_prompt is not None:
-                        AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP.pop(remetente, None)
+                        AGUARDANDO_CONTRATO_AUTENTICADOR_WHATSAPP.pop(chave_conversa, None)
                         if (time.time() - ts_prompt) <= TIMEOUT_AGUARDANDO_CONTRATO_AUTENTICADOR_SEG:
                             try:
-                                processar_consulta_autenticador_whatsapp(texto_bruto)
+                                processar_consulta_autenticador_whatsapp(
+                                    texto_bruto,
+                                    destino=destino_resposta)
                             except Exception:
                                 logger.exception("Falha ao processar consulta do /autenticador via WhatsApp.")
-                                enviar_alerta_whatsapp_grupo("⚠️ Erro inesperado ao consultar o Autenticador. Tente novamente com /autenticador.")
+                                _responder("⚠️ Erro inesperado ao consultar o Autenticador. Tente novamente com /autenticador.")
                         else:
-                            enviar_alerta_whatsapp_grupo("⏱️ Tempo para digitar o contrato expirou. Envie /autenticador novamente.")
+                            _responder("⏱️ Tempo para digitar o contrato expirou. Envie /autenticador novamente.")
                         continue
 
         except requests.exceptions.Timeout:
@@ -6876,6 +8581,10 @@ def executar_monitoramento(exibir=None):
                 # chamado" acontece logo de saída, justamente uma vez.
                 agendamentos_mudaram = False
                 os_reparo_abertas = set()
+                # Lido UMA vez por varredura, e não por chamado: são centenas
+                # de chamados por volta, e reler o arquivo em cada um trocaria
+                # uma decisão que não muda por centenas de leituras de disco.
+                estado_alertas_opcionais = alertas_opcionais.carregar()
 
                 for chamado in lista_chamados:
                     # Batida por chamado. Notificar não é instantâneo: cada O.S.
@@ -6980,6 +8689,29 @@ def executar_monitoramento(exibir=None):
                                             f"'{achado['motivo']}' de {achado['dias']} dia(s) atrás."
                                         )
 
+                                    # Endereço em área de risco. Mesma
+                                    # ordem e mesma razão do bloco acima: vem
+                                    # DEPOIS de a O.S. estar carimbada como
+                                    # notificada, para que uma falha aqui não
+                                    # faça o entrante ser anunciado de novo no
+                                    # ciclo seguinte.
+                                    lat_risco, lng_risco = coordenada_do_chamado(chamado)
+                                    risco = verificar_area_risco(
+                                        unidade, bairro,
+                                        chamado.get('enderecoLogradouro'),
+                                        lat_risco, lng_risco
+                                    )
+                                    if risco:
+                                        notificar_area_risco_telegram(
+                                            cidade, contrato, nome_cliente, bairro,
+                                            telefones_str, risco
+                                        )
+                                        logger.warning(
+                                            f"ÁREA DE RISCO: OS {os_id} ({nome_cliente}) "
+                                            f"— {risco['bairro']} / {risco['rua']}, "
+                                            f"casou por {risco['casou_por']}."
+                                        )
+
                                     if TV_ATIVA:
                                         FILA_EVENTOS_TV.put({
                                             'tipo': 'capex',
@@ -7016,7 +8748,55 @@ def executar_monitoramento(exibir=None):
                                     f"Falha ao acompanhar remarcação da OS {os_id}."
                                 )
 
-                    elif codigo == 'ES05':
+                    elif codigo in alertas_opcionais.CODIGOS:
+                        # Upgrade e mudança de cômodo só avisam quando a
+                        # coordenação liga, e só na região que ela escolheu --
+                        # ver alertas_opcionais.py.
+                        unidade = str(chamado.get('enderecoUnidade', '')).upper().strip()
+                        data_abertura_ms = chamado.get('dataAbertura')
+                        aberto_em = (data_abertura_ms / 1000.0
+                                     if data_abertura_ms else None)
+                        if not alertas_opcionais.deve_alertar(
+                                codigo, unidade, aberto_em,
+                                estado_alertas_opcionais, LITORAL_SP, RJ):
+                            continue
+                        if not unidade_bairro_permitido(
+                                unidade, chamado.get('enderecoBairro', '')):
+                            continue
+
+                        os_id = chamado.get('id')
+                        if os_id and os_id not in os_notificadas:
+                            try:
+                                cidade = (chamado.get('enderecoCidade') or '').strip() or unidade
+                                nome_cliente = chamado.get('nomeCliente', 'N/D')
+                                if isinstance(nome_cliente, str):
+                                    nome_cliente = nome_cliente.strip() or 'N/D'
+                                telefones, _ = extrair_telefones_do_chamado(chamado)
+                                mensagem = (
+                                    f"{alertas_opcionais.CODIGOS[codigo].upper()}: {cidade}\n"
+                                    f"• Contrato: {chamado.get('codigoContrato', 'N/D')}\n"
+                                    f"• Cliente: {nome_cliente}\n"
+                                    f"• Bairro: {chamado.get('enderecoBairro', 'N/D')}\n"
+                                    f"• Telefone(s): {', '.join(telefones) if telefones else 'N/D'}"
+                                )
+                                if enviar_alerta_telegram(mensagem) is not None:
+                                    os_notificadas.add(os_id)
+                                    salvar_os_notificadas(os_notificadas)
+                                    logger.info("Notificada: OS %s - %s (%s)",
+                                                os_id, codigo, nome_cliente)
+                                else:
+                                    logger.error(
+                                        "Falha ao notificar %s da OS %s – será "
+                                        "reprocessada no próximo ciclo.",
+                                        codigo, os_id)
+                                time.sleep(0.2)
+                            except Exception:
+                                logger.exception(
+                                    "Falha ao processar/notificar %s da OS %s. "
+                                    "Será reavaliado no próximo ciclo.",
+                                    codigo, os_id)
+
+                    elif codigo in CODIGOS_REPARO_CAMPO:
                         os_id = chamado.get('id')
                         chave_reparo = str(os_id) if os_id else None
 
@@ -7315,7 +9095,13 @@ def executar_monitoramento(exibir=None):
                 # (Mudança de Cômodo) nesta lista -- por isso o backlog
                 # desses dois tipos sempre dava zero: a API nem devolvia
                 # esses chamados, então não tinha nada pra calcular. ============
-                filas_alvo = list(set(CODIGOS_ALVO + ["ES05", "ES06", "REPPME", "UP02", "ES15"]))
+                # UP02 e ES15 vêm de alertas_opcionais.CODIGOS: são os
+                # mesmos que o /alertas liga, e tê-los em duas listas faria
+                # ligar um alerta para uma fila que a busca não pede -- alerta
+                # que nunca sai, sem erro nenhum.
+                filas_alvo = list(set(CODIGOS_ALVO + CODIGOS_REPARO_CAMPO +
+                                      list(alertas_opcionais.CODIGOS) +
+                                      ["ES06"]))
                 payload1 = {
                     "enderecoUnidade": unidades_alvo,
                     "dataConclusao": "IS NULL",
@@ -7363,7 +9149,7 @@ def executar_monitoramento(exibir=None):
                     payload2 = {
                         "enderecoUnidade": list(SIGLAS_GARANTIA_EXTRA),
                         "dataConclusao": "IS NULL",
-                        "fila_codigo": ["ES05"],
+                        "fila_codigo": list(CODIGOS_REPARO_CAMPO),
                         "contrato": None
                     }
                     try:
@@ -7603,6 +9389,9 @@ def executar_monitoramento(exibir=None):
                 )
 
                 ciclos_vazios_seguidos = 0
+                # Ciclos seguidos em que a varredura foi tentada mas o token/URL
+                # da API ainda não estava disponível -- ver MAX_CICLOS_SEM_TOKEN.
+                ciclos_sem_token = 0
                 # 0.0 faz a PRIMEIRA volta já rodar a varredura completa -- senão
                 # o backlog nasceria vazio e ficaria assim até o primeiro intervalo.
                 ultima_varredura_completa_ts = 0.0
@@ -7778,6 +9567,8 @@ def executar_monitoramento(exibir=None):
                         continue
 
                     if tentou:
+                        # A varredura saiu de verdade -> o token estava lá.
+                        ciclos_sem_token = 0
                         logger.info(
                             f"🔄 Varredura concluída: {len(lista_chamados)} chamados analisados."
                         )
@@ -7834,7 +9625,12 @@ def executar_monitoramento(exibir=None):
                         # há nada de errado para recuperar -- e o reload aqui custa
                         # caro: derruba o token que o listener capturou e obriga a
                         # clicar em 'Carregar chamados' de novo.
-                        logger.warning("Token/URL da API ainda não disponíveis. Tentando usar listener como fallback...")
+                        ciclos_sem_token += 1
+                        logger.warning(
+                            "Token/URL da API ainda não disponíveis "
+                            f"({ciclos_sem_token}/{MAX_CICLOS_SEM_TOKEN}). "
+                            "Tentando usar listener como fallback..."
+                        )
                         reload_seguro(pagina)
                         if "login" in pagina.url:
                             logger.warning("Página de login detectada após reload. Refazendo login...")
@@ -7848,6 +9644,23 @@ def executar_monitoramento(exibir=None):
                                     pagina.wait_for_timeout(3000)
                             except Exception:
                                 pass
+
+                        # Reload + clique não trouxeram o token em MAX_CICLOS_SEM_TOKEN
+                        # voltas: a sessão está num limbo em que o relogin "deu certo"
+                        # mas o listener nunca captura. Recarregar de novo não vai
+                        # resolver -- só um navegador novo. Reabre pelo laço externo,
+                        # que é o mesmo caminho da guarda de zumbi acima.
+                        if ciclos_sem_token >= MAX_CICLOS_SEM_TOKEN:
+                            logger.error(
+                                f"{ciclos_sem_token} ciclos sem capturar token/URL da API "
+                                "após relogin. Reabrindo o navegador do zero."
+                            )
+                            enviar_alerta_telegram(
+                                f"🟠 {ciclos_sem_token} ciclos sem pegar o token do CAMPO "
+                                "depois do relogin (nenhuma varredura saindo). "
+                                "Reabrindo o navegador automaticamente..."
+                            )
+                            break
 
                     time.sleep(INTERVALO_BUSCA)
 
@@ -7935,6 +9748,39 @@ def main():
         threading.Thread(
             target=garantias_envio.thread_agendador_garantias,
             args=(estado_para_lista_garantias,),
+            daemon=True,
+        ).start()
+
+        # ====== NOVO (01/09/2026): prévia da carga do dia seguinte no grupo
+        # do litoral, todo dia às 15h40. Mesma decisão das outras: não dispara
+        # ao subir, só na hora marcada. ======
+        threading.Thread(
+            target=thread_agendador_carga,
+            daemon=True,
+        ).start()
+
+        # ============ NOVO (20/08/2026): painel de resultados no automático.
+        # Baixa a extração do OFS, gera as telas e manda no grupo, de hora em
+        # hora das 7h às 22h. Antes isso era feito à mão, uma vez por hora, e
+        # às vezes o horário passava. Mesma decisão da lista de garantias: não
+        # dispara ao subir, só na hora marcada. ============
+        threading.Thread(
+            target=painel_resultados.thread_agendador_painel_resultados,
+            daemon=True,
+        ).start()
+
+        # ============ NOVO (26/08/2026): as bases do OFS se refazem sozinhas.
+        # A base de garantias e a de improdutivas eram duas planilhas que
+        # alguém exportava do OFS e subia pelo site todo dia. Enquanto
+        # dependeram disso, atrasaram: em 26/08 a das improdutivas estava
+        # parada havia dois dias e a das garantias cobria 44 dias em vez de 30.
+        # Base velha não dá erro, só responde errado -- e ninguém percebe.
+        # Agora uma reconstrução por madrugada refaz a janela inteira a partir
+        # da mesma extração que o painel usa. O envio pelo site continua
+        # existindo, como saída manual. ============
+        threading.Thread(
+            target=ofs_base_historica.thread_agendador_base_historica,
+            args=(enviar_alerta_whatsapp_grupo,),
             daemon=True,
         ).start()
 

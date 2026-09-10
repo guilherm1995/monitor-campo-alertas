@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=VPN Sumicity (ícone da bandeja)
+Comment=Mostra o estado da VPN e avisa quando cai
+Exec=/home/guilherme/.local/bin/vpn-tray
+Icon=network-vpn-symbolic
+Terminal=false
+X-KDE-autostart-phase=2
+NoDisplay=true
