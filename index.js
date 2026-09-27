@@ -450,6 +450,15 @@ async function iniciar() {
         const ehRegiao = Object.values(config.gruposRegiao || {}).includes(de);
         if (!ehPrivado && !ehPrincipal && !ehRegiao) continue;
 
+        // QUAL regiao, e nao so "e de alguma". O Python precisa disto para a
+        // previa da carga: ate 23/09/2026 ele recebia so o JID, nao tinha como
+        // saber de que regional o grupo era, e respondia /carga sempre com a
+        // tabela do litoral -- inclusive no grupo do Rio. O mapa de JIDs mora
+        // aqui, entao a resposta sai daqui; uma segunda copia do lado do
+        // Python divergiria na primeira regiao nova.
+        const regiao = Object.keys(config.gruposRegiao || {})
+          .find((chave) => config.gruposRegiao[chave] === de) || null;
+
         // A contrapartida de aceitar 'append': a fila reproduzida pode arrastar
         // mensagem de horas ou dias atrás, e comando não é histórico -- é ordem.
         // Executar um "desligar" de anteontem porque o WhatsApp resolveu
@@ -494,6 +503,7 @@ async function iniciar() {
               timestamp: Date.now(),
               privado: ehPrivado,
               principal: ehPrincipal,
+              regiao,
               conversa: m.key.remoteJid,
             });
             if (filaMensagens.length > FILA_MENSAGENS_MAX) {
@@ -519,6 +529,7 @@ async function iniciar() {
           timestamp: Date.now(),
           privado: ehPrivado,
           principal: ehPrincipal,
+          regiao,
           conversa: m.key.remoteJid,
         });
         if (filaMensagens.length > FILA_MENSAGENS_MAX) {

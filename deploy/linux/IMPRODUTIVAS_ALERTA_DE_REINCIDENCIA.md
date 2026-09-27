@@ -31,6 +31,12 @@ Que a mesma O.S. volta é visível na própria base: no arquivo de 13/08 a O.S.
 
 ### O aviso do entrante
 
+> Os valores do exemplo abaixo são FICTÍCIOS. Até 27/09/2026 este
+> bloco era uma cópia crua de um alerta de produção: só o nome do
+> cliente tinha sido trocado, e o telefone, o contrato, as O.S. e o
+> nome do técnico eram reais -- e este arquivo vai para o portfólio
+> público. Amostra de produção não entra em documentação.
+
 ```
 IMPRODUTIVA ANTERIOR: CGT
 • Contrato: 999999

@@ -151,8 +151,13 @@ COLUNAS_BUSCA_LIVRE = (
 )
 
 # As colunas que sao numero e devem ser comparadas so pelos digitos. Telefone
-# aparece na base como "DDD9XXXXXXXX" e a pessoa digita "(DDD) 9XXXX-XXXX" -- sao
+# aparece na base como "12999999999" e a pessoa digita "(12) 99999-9999" -- sao
 # o mesmo numero, e comparar o texto cru nunca casaria.
+#
+# O exemplo e um numero FALSO de proposito, todo 9, como o 5512999999999 usado
+# no resto do repositorio. Ate 27/09/2026 estava aqui um numero de DDD 12 com
+# cara de ter sido copiado da base -- e este arquivo vai para o portfolio
+# publico. Amostra de producao nao entra em comentario nem em exemplo.
 COLUNAS_SO_DIGITOS = (
     'CEP/Código Postal',
     'Telefone',
@@ -303,9 +308,9 @@ DECLARACOES = [{'functionDeclarations': [
             'essas colunas ao mesmo tempo e diz em qual casou. '
             'Use sempre que a pergunta identificar alguem por algo que nao '
             'seja o contrato -- "ja atendemos a Maria Silva?", "de quem e o '
-            'telefone DDD9XXXXXXXX?", "teve atendimento na Rua das Flores?". '
+            'telefone 12999999999?", "teve atendimento na Rua das Flores?". '
             'O nome pode vir pela metade e o telefone pode vir formatado: '
-            '"(DDD) 9XXXX-XXXX" acha "DDD9XXXXXXXX". '
+            '"(12) 99999-9999" acha "12999999999". '
             'Alcanca todo o historico do OFS GERAL, inclusive concluidos e '
             'cancelados, e tambem as O.S. em aberto no CAMPO.'
         ),
@@ -359,16 +364,17 @@ DECLARACOES = [{'functionDeclarations': [
     {
         'name': 'carga_do_dia_seguinte',
         'description': (
-            'A PREVIA DA CARGA: toda a carga do Litoral Norte num dia, ja '
-            'contada por cidade, por tipo e por turno. Use para "como esta a '
-            'carga de amanha", "previa de amanha", "quantas O.S. temos amanha '
-            'no litoral", "quanto tem no balde". '
+            'A PREVIA DA CARGA: toda a carga de um dia na regional DESTE '
+            'grupo, ja contada por cidade, por tipo e por turno. Use para '
+            '"como esta a carga de amanha", "previa de amanha", "quantas O.S. '
+            'temos amanha", "quanto tem no balde". '
+            'A regional sai no campo "recorte" da resposta -- diga qual e, e '
+            'nunca fale de cidade que nao esteja ali. '
             'Atualiza a base no OFS antes de contar. '
             'Entra o que esta no balde esperando alguem E o que ja esta na '
             'rota de um tecnico -- e tudo carga do dia, e a previa nao separa '
             'as duas coisas. Tudo menos cancelado, e so Ativacao, Mudanca '
-            'de Endereco e Reparo. Sao Sebastiao aparece partida em TOPO e '
-            'COSTA SUL, e Bertioga entra por bairro. '
+            'de Endereco e Reparo. '
             'Os totais ja vem somados: use os numeros como estao, nao some '
             'nada por conta.'
         ),
@@ -591,10 +597,15 @@ class Buscador:
     """
 
     def __init__(self, chamados=None, caminho_ofs_geral=None, agora=None,
-                 bases=None):
+                 bases=None, regiao=None):
         self.chamados = list(chamados or ())
         self.caminho_ofs_geral = caminho_ofs_geral
         self.agora = agora or datetime.now()
+        # De QUAL regional e o grupo que perguntou. Sem isto a previa da carga
+        # respondia sempre pelo litoral -- inclusive no grupo do Rio, que e o
+        # mesmo erro calado que o /carga tinha ate 23/09/2026. Vazio = litoral,
+        # que e como sempre foi no grupo principal e no privado.
+        self.regiao = (regiao or 'litoral').strip().lower()
         self.feitas = []
         # As bases moram ao lado do OFS GERAL. Quem chama pode passar outra
         # lista -- e o que a avaliacao faz, para nao ler as bases de verdade.
@@ -664,13 +675,22 @@ class Buscador:
                 % (estado.get('motivo'), quando))
 
     def carga_do_dia_seguinte(self, data=None):
-        """A previa da carga, ja contada. O motor vive em carga_litoral.py."""
+        """A previa da carga da regional deste grupo. O motor e o carga_litoral."""
         estado = self._base_fresca()
         try:
             import carga_litoral
+            import carga_rj
         except Exception:
-            logger.exception('Nao consegui importar o carga_litoral.')
+            logger.exception('Nao consegui importar o motor da previa da carga.')
             return {'erro': 'O modulo da previa da carga nao esta disponivel.'}
+
+        recortes = {'litoral': carga_litoral.RECORTE_LITORAL,
+                    'rj': carga_rj.RECORTE_RJ}
+        recorte = recortes.get(self.regiao)
+        if recorte is None:
+            logger.error('Regiao desconhecida na previa do /bot: %r. Usando o '
+                         'litoral.', self.regiao)
+            recorte = recortes['litoral']
 
         dia = None
         if data:
@@ -687,12 +707,13 @@ class Buscador:
         # e assim que a avaliacao aponta a previa para uma base de ensaio em
         # vez da base de producao.
         carga = carga_litoral.levantar_carga(
-            quando=dia, agora=self.agora,
+            quando=dia, agora=self.agora, recorte=recorte,
             caminho=self.caminho_ofs_geral or None)
         resultado = {
             'data': carga['data'].strftime('%d/%m/%Y'),
-            'recorte': ('Litoral Norte, balde e rotas de tecnico, tudo menos '
-                        'cancelado, so Ativacao / Mudanca de Endereco / Reparo'),
+            'recorte': ('%s, balde e rotas de tecnico, tudo menos '
+                        'cancelado, so Ativacao / Mudanca de Endereco / Reparo'
+                        % recorte.nome),
             'total': carga['total'],
             'por_turno': {turno: carga_litoral.total_do_turno(carga, turno)
                           for turno in carga['turnos']},
@@ -704,9 +725,12 @@ class Buscador:
                 'TODOS os numeros acima ja estao somados. "capa" e '
                 'cidade -> tipo -> turno -> quantidade; "por_cidade" e '
                 '"por_tipo" sao os mesmos dados ja totalizados. Leia o numero '
-                'que a pergunta pede e nao refaca nenhuma soma. '
-                'COSTA SUL e TOPO sao as duas metades de Sao Sebastiao, e '
-                'Bertioga esta dentro de COSTA SUL.'),
+                'que a pergunta pede e nao refaca nenhuma soma.'
+                # A nota das metades de Sao Sebastiao e do litoral e so dele:
+                # no Rio ela descreveria uma cidade que nao esta na tabela.
+                + (' COSTA SUL e TOPO sao as duas metades de Sao Sebastiao, e '
+                   'Bertioga esta dentro de COSTA SUL.'
+                   if recorte.chave == 'litoral' else '')),
         }
         if carga.get('aviso'):
             resultado['aviso'] = carga['aviso']

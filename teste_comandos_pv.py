@@ -27,6 +27,7 @@ import bot_campo_monitoramento as b
 PV = 'operador@provedor.example'
 GRUPO_PRINCIPAL = 'grupo-principal@g.us'
 GRUPO_REGIAO = 'grupo-litoral@g.us'
+GRUPO_REGIAO_RJ = 'grupo-rj@g.us'
 
 enviados = []
 disparos = []
@@ -94,9 +95,14 @@ def rodar(lote):
     return list(enviados), list(disparos)
 
 
-def msg(texto, privado=False, principal=False, conversa=None, participante=None):
+def msg(texto, privado=False, principal=False, conversa=None, participante=None,
+        regiao=None):
     return {'participante': participante or (PV if privado else 'alguem@x'),
             'texto': texto, 'privado': privado, 'principal': principal,
+            # Quem diz a regional e o servico do Node (`gruposRegiao`). O campo
+            # chega junto da mensagem desde 23/09/2026 -- e o que faz o /carga
+            # do grupo do Rio contar o Rio.
+            'regiao': regiao,
             'conversa': conversa or (PV if privado
                                      else (GRUPO_PRINCIPAL if principal
                                            else GRUPO_REGIAO))}
@@ -157,8 +163,31 @@ conferir('/improdutivas no grupo principal',
          'responder_improdutivas', {'destino': None})
 
 # ---- grupo de regiao: so /bot e /carga, e sai no proprio grupo
-conferir('/carga no grupo de regiao', [msg('/carga')], GRUPO_REGIAO,
-         'gerar_e_enviar_carga', {'destino_whatsapp': GRUPO_REGIAO})
+conferir('/carga no grupo de regiao', [msg('/carga', regiao='litoral')],
+         GRUPO_REGIAO, 'gerar_e_enviar_carga',
+         {'destino_whatsapp': GRUPO_REGIAO, 'regiao': 'litoral'})
+
+# O caso que motivou o campo `regiao`: antes disto o grupo do Rio pedia /carga
+# e recebia a tabela do litoral, com cara de resposta certa.
+conferir('/carga no grupo do RJ conta o RJ',
+         [msg('/carga', conversa=GRUPO_REGIAO_RJ, regiao='rj')],
+         GRUPO_REGIAO_RJ, 'gerar_e_enviar_carga',
+         {'destino_whatsapp': GRUPO_REGIAO_RJ, 'regiao': 'rj'})
+
+# O /bot tinha o mesmo defeito do /carga: a ferramenta da previa contava
+# sempre o litoral. A regional viaja junto da pergunta desde 23/09/2026.
+if assistente_ia.disponivel():
+    conferir('/bot no grupo do RJ pergunta pelo RJ',
+             [msg('/bot como esta a carga de amanha',
+                  conversa=GRUPO_REGIAO_RJ, regiao='rj')],
+             GRUPO_REGIAO_RJ, 'responder_pergunta_bot',
+             {'destino': GRUPO_REGIAO_RJ, 'regiao': 'rj'})
+    conferir('/bot no grupo do litoral segue litoral',
+             [msg('/bot como esta a carga de amanha', regiao='litoral')],
+             GRUPO_REGIAO, 'responder_pergunta_bot',
+             {'destino': GRUPO_REGIAO, 'regiao': 'litoral'})
+else:
+    print('%-42s pulado: assistente indisponivel' % '/bot por regiao')
 
 enviados_, disparos_ = rodar([msg('/reiniciar')])
 if enviados_ or disparos_:

@@ -133,7 +133,7 @@ Duas normalizações fazem ela acertar no caso comum:
 
 - **acento e caixa**: quem digita escreve `fulana de tal`, a base guarda
   `FULANA DE TAL DOS SANTOS SILVA`;
-- **telefone só por dígito**: `(DDD) 9XXXX-XXXX` acha `DDD9XXXXXXXX`.
+- **telefone só por dígito**: `(12) 99999-9999` acha `12999999999`.
 
 Termo com menos de 4 dígitos não é tratado como número -- senão o "30" de
 "30 dias" casaria com meio arquivo.

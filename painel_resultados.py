@@ -138,7 +138,14 @@ _estado_aviso = {'falhando': False, 'ultimo_aviso': 0.0}
 # de painel perdidas com a chave já na mão desde as 08:12. Cookie novo é a
 # única prova barata de que existe sessão viva AGORA; esperar a próxima hora
 # cheia depois disso é perder painel à toa.
-_pendente_por_sessao = {'sim': False}
+#
+# 'carimbo' é o do INSTANTE DA FALHA, não o do início da espera. Em 12/09/2026 a
+# renovação chegou 12s depois do alerta -- dentro do sleep de 61s que separa o
+# ciclo falhado do rearme da espera -- e a espera nascia adotando o cookie JÁ
+# renovado como referência, então a retomada nunca disparava. Renovar logo após
+# ver o alerta é o comportamento normal de quem lê o grupo: era justamente o
+# caso comum que não funcionava.
+_pendente_por_sessao = {'sim': False, 'carimbo': 0.0}
 
 # A abertura do dia (fechamento da véspera + agenda de hoje) sai UMA vez por
 # dia, no primeiro ciclo que der certo -- não mais às 7h em ponto.
@@ -476,6 +483,7 @@ def rodar_ciclo(destino=None):
             # Fica marcado: quando o cookie novo chegar, este ciclo é refeito
             # na hora, sem esperar a próxima hora cheia.
             _pendente_por_sessao['sim'] = True
+            _pendente_por_sessao['carimbo'] = carimbo_cookie()
             saiu_no_grupo = _avisar_falha(
                 '⚠️ *Painel de resultados parado*\n\n'
                 'A sessão do OFS venceu, então não consigo baixar a extração sozinho.\n\n'
@@ -595,7 +603,6 @@ def thread_agendador_painel_resultados():
         # Dorme em fatias: numa espera longa (a noite inteira), um relógio
         # corrigido ou uma máquina que suspendeu fariam a thread acordar muito
         # depois da hora. Em fatias, o alvo é reconferido.
-        cookie_visto = carimbo_cookie()
         recuperar = False
         while True:
             restante = (alvo - datetime.now()).total_seconds()
@@ -607,9 +614,8 @@ def thread_agendador_painel_resultados():
 
             agora = datetime.now()
             if (_pendente_por_sessao['sim']
-                    and carimbo_cookie() != cookie_visto
+                    and carimbo_cookie() != _pendente_por_sessao['carimbo']
                     and HORA_INICIO <= agora.hour <= HORA_FIM):
-                cookie_visto = carimbo_cookie()
                 recuperar = True
                 break
 

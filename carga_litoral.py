@@ -140,6 +140,24 @@ TOPO_BAIRROS = (
     # Acrescentado em 03/09/2026, pela operacao.
     'PORTO GRANDE',
     'PONTAL DA CRUZ',
+    # Pitangueiras e TOPO, nao Costa Sul. Dito pela operacao em 23/09/2026,
+    # depois de ver a previa mandar a atividade de la para a rota errada.
+    #
+    # ATENCAO AO "S": o casamento e por PALAVRA INTEIRA, entao PITANGUEIRAS nao
+    # pega PITANGUEIRA nem o contrario -- o S no fim quebra o limite de
+    # palavra. As duas formas precisam estar aqui, e a singular e justamente a
+    # que estava na base no dia do achado ('PRAIA DA PITANGUEIRA'). Listar so
+    # o plural, que foi como o bairro foi dito, teria deixado a unica linha
+    # real continuar caindo em COSTA SUL -- conserto que parece feito e nao e.
+    #
+    # As formas nuas ja cobrem os prefixos "PRAIA DA"/"PRAIA DAS"; as variantes
+    # ficam escritas assim mesmo, como as de CIGARRAS e OLARIA acima, para a
+    # lista mostrar o que aparece na base em vez de exigir que se deduza.
+    'PITANGUEIRAS',
+    'PRAIA DA PITANGUEIRAS',
+    'PRAIA DAS PITANGUEIRAS',
+    'PITANGUEIRA',
+    'PRAIA DA PITANGUEIRA',
 )
 
 TOPO = 'TOPO'
@@ -269,6 +287,41 @@ ORDEM_TURNOS = ('Manhã', 'Inicio Manhã', 'Almoço', 'Tarde')
 TOTAL = 'Total Geral'
 
 
+# ============================== o recorte por regional =======================
+#
+# A prévia nasceu só para o Litoral Norte, e a regional inteira estava embutida
+# no módulo: `cidade_efetiva` sabia as cidades, `_no_balde` sabia os baldes.
+# Quando o Sul RJ entrou, em 23/09/2026, a escolha foi entre copiar o módulo e
+# parametrizá-lo. Cópia divergiria na primeira regra nova -- é a mesma lição de
+# BAIRROS_DE_BERTIOGA_QUE_ATENDEMOS, que mora aqui justamente para existir uma
+# cópia só.
+#
+# O `Recorte` é o que muda de uma regional para a outra, e nada mais. A
+# contagem, os turnos, os tipos, a capa e a lista são os mesmos para as duas --
+# e precisam continuar sendo, porque é a mesma pergunta sendo feita.
+class Recorte:
+    """Qual pedaço do mundo a prévia conta, e como ela nomeia as rotas.
+
+    `cidade` recebe os três campos que podem decidir a rota -- o `Cidade` do
+    OFS, o `Endereço` e a `Chave Workzone` -- e devolve o rótulo da rota, ou
+    `None` quando a linha não é nossa. Cada regional usa os campos de que
+    precisa: o Litoral decide por cidade + bairro, porque a divisa da cidade
+    não é a divisa da rota; o RJ decide pela sigla da workzone, porque lá ela
+    bate com a cidade em 97% das linhas e o balde não diz a rota.
+
+    `colunas_exigidas` existe para o recorte poder RECLAMAR. Sem ela, uma base
+    sem a coluna de que a regional depende devolveria prévia vazia -- que é
+    indistinguível de um dia sem carga, o pior tipo de erro.
+    """
+
+    def __init__(self, chave, nome, cidade, baldes, colunas_exigidas=()):
+        self.chave = chave
+        self.nome = nome
+        self.cidade = cidade
+        self.baldes = baldes
+        self.colunas_exigidas = tuple(colunas_exigidas)
+
+
 # ============================== texto ========================================
 
 def achatar(texto):
@@ -392,8 +445,17 @@ def _tipo_da_carga(tipo):
     return None
 
 
-def _no_balde(recurso):
-    return achatar(recurso) in {achatar(b) for b in BALDES_LITORAL}
+def _no_balde(recurso, baldes=BALDES_LITORAL):
+    return achatar(recurso) in {achatar(b) for b in baldes}
+
+
+# O Litoral ignora a workzone: quem decide a rota aqui é a cidade com o bairro.
+RECORTE_LITORAL = Recorte(
+    chave='litoral',
+    nome='Litoral Norte',
+    cidade=lambda cidade, endereco, workzone: cidade_efetiva(cidade, endereco),
+    baldes=BALDES_LITORAL,
+)
 
 
 # ============================== a base =======================================
@@ -441,13 +503,14 @@ def _mesma_data(valor, alvo):
 
 # ============================== a conta ======================================
 
-def levantar_carga(quando=None, caminho=None, agora=None):
+def levantar_carga(quando=None, caminho=None, agora=None, recorte=None):
     """Monta a prévia da carga de um dia. Sem argumento, é a de amanhã.
 
     Devolve um dicionário com TUDO já contado -- capa, lista e totais. Nada
     aqui é deixado "para quem lê somar depois": esta é a mesma regra do dossiê
     do /bot, e pela mesma razão. Contar é de graça aqui e caro lá.
     """
+    recorte = recorte or RECORTE_LITORAL
     agora = agora or datetime.now()
     dia = quando or (agora + timedelta(days=1)).date()
     if isinstance(dia, datetime):
@@ -467,6 +530,10 @@ def levantar_carga(quando=None, caminho=None, agora=None):
         'arquivo': caminho,
         'atualizado_em': None,
         'aviso': None,
+        # Quem lê a prévia precisa saber de QUAL regional ela é. Sem isto o
+        # render e o texto diriam "Litoral Norte" em cima dos números do Rio.
+        'regiao': recorte.chave,
+        'regiao_nome': recorte.nome,
     }
 
     if not os.path.exists(caminho):
@@ -494,11 +561,15 @@ def levantar_carga(quando=None, caminho=None, agora=None):
     col_tipo = _coluna(quadro, 'Tipo de Atividade.1')
     col_os = _coluna(quadro, 'Ordem de Serviço')
     col_contrato = _coluna(quadro, 'Número do contrato')
+    col_workzone = _coluna(quadro, 'Chave Workzone')
 
     faltando = [rotulo for rotulo, col in (
         ('Data', col_data), ('Recurso', col_recurso),
         ('Status da Atividade', col_status), ('Cidade', col_cidade),
         ('Endereço', col_endereco), ('Tipo de Atividade.1', col_tipo),
+        # A coluna de que ESTA regional depende. Para o RJ é a Chave Workzone;
+        # sem ela a prévia sairia vazia fingindo dia sem carga.
+        *((rotulo, _coluna(quadro, rotulo)) for rotulo in recorte.colunas_exigidas),
     ) if col is None]
     if faltando:
         vazio['aviso'] = 'a base não tem a(s) coluna(s): ' + ', '.join(faltando)
@@ -520,7 +591,9 @@ def levantar_carga(quando=None, caminho=None, agora=None):
         tipo = _tipo_da_carga(linha[col_tipo])
         if not tipo:
             continue
-        cidade = cidade_efetiva(linha[col_cidade], linha[col_endereco])
+        cidade = recorte.cidade(
+            linha[col_cidade], linha[col_endereco],
+            linha[col_workzone] if col_workzone is not None else '')
         if not cidade:
             continue
         identificador = str(linha[col_os]).strip() if col_os else ''
@@ -544,7 +617,7 @@ def levantar_carga(quando=None, caminho=None, agora=None):
             # do técnico. `no_balde` diz qual dos dois, para quem lê não
             # precisar conhecer a lista de baldes de cor.
             'recurso': recurso,
-            'no_balde': _no_balde(recurso),
+            'no_balde': _no_balde(recurso, recorte.baldes),
             'os': identificador,
             'contrato': str(linha[col_contrato]).strip() if col_contrato else '',
         })
@@ -625,12 +698,12 @@ def texto_da_carga(carga, detalhado=False, teto_detalhe=40):
     if carga.get('aviso'):
         return '⚠️ Não consegui montar a prévia de %s: %s.' % (dia, carga['aviso'])
     if not carga['total']:
-        return ('📋 *PRÉVIA DA CARGA — %s*\n\nNenhuma atividade no Litoral '
-                'Norte para esse dia.' % dia)
+        return ('📋 *PRÉVIA DA CARGA — %s*\n\nNenhuma atividade em %s '
+                'para esse dia.' % (dia, carga.get('regiao_nome', 'Litoral Norte')))
 
     turnos = carga['turnos']
     partes = ['📋 *PRÉVIA DA CARGA — %s (D+1)*' % dia,
-              'Litoral Norte, tudo menos cancelado.',
+              '%s, tudo menos cancelado.' % carga.get('regiao_nome', 'Litoral Norte'),
               '']
     partes.append('*%d atividades* no total: %s.' % (
         carga['total'],

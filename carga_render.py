@@ -230,7 +230,7 @@ def gerar_html_capa(carga):
   <div class="cabecalho">
     <div class="titulo-principal">Prévia da carga &middot; <span>{_e(carga['data'].strftime('%d/%m/%Y'))}</span></div>
     <div class="subtitulo">
-      Litoral Norte, balde e rotas &middot; Ativação, Mudança de Endereço e Reparo &middot;
+      {_e(carga.get('regiao_nome', 'Litoral Norte'))}, balde e rotas &middot; Ativação, Mudança de Endereço e Reparo &middot;
       tudo menos cancelado &middot; apurado em {_e(datetime.now().strftime('%d/%m %H:%M'))}
     </div>
   </div>
@@ -294,7 +294,7 @@ def gerar_html_lista(carga):
   <div class="cabecalho">
     <div class="titulo-principal">Lista detalhada &middot; <span>{_e(carga['data'].strftime('%d/%m/%Y'))}</span></div>
     <div class="subtitulo">
-      {carga['total']} atividades no Litoral Norte &middot;
+      {carga['total']} atividades &middot; {_e(carga.get('regiao_nome', 'Litoral Norte'))} &middot;
       apurado em {_e(datetime.now().strftime('%d/%m %H:%M'))}
     </div>
   </div>

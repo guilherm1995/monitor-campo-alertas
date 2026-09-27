@@ -69,6 +69,7 @@ import garantias_lista
 import painel_resultados
 import ofs_base_historica
 import improdutivas
+import improdutivas_dia
 import area_risco
 import assistente_ia
 import busca_operacao
@@ -722,6 +723,16 @@ _MARCAS_CONTEXTO_MORTO = (
 )
 
 
+class TelaEmBrancoDoAir(Exception):
+    """A SPA do CAMPO não montou -- só um navegador com cache limpo resolve.
+
+    Tem classe própria porque precisa ATRAVESSAR o `except Exception` de
+    `refazer_login`: ali qualquer erro vira "falha ao refazer login" e o bot
+    segue tentando na mesma página branca. Este caso não é falha de login, é
+    frontend velho em cache, e o conserto está no laço externo.
+    """
+
+
 class ContextoNavegadorMorto(Exception):
     """O contexto/navegador do Playwright morreu; exige reabrir o navegador."""
 
@@ -731,6 +742,18 @@ def _e_erro_de_contexto_morto(erro):
     return any(marca in texto for marca in _MARCAS_CONTEXTO_MORTO)
 
 CST_PERFIL_DIRETORIO = os.path.join(os.getcwd(), "perfil_campo_logistica")
+
+# Diretórios de cache do Chromium dentro do perfil. Apagar SÓ estes: `Cookies`,
+# `Local Storage`, `Login Data` e `Preferences` ficam, então a sessão do CAMPO
+# sobrevive à limpeza -- depois dela o bot NÃO precisa de login nem de MFA.
+# Confirmado na mão em 23/09/2026, numa cópia do perfil, antes de aplicar.
+CACHE_DO_PERFIL = ("Cache", "Code Cache", "GPUCache", "Service Worker")
+
+# Uma limpeza, e só. Tela em branco por bundle velho se resolve na primeira; se
+# continuar em branco depois disso, a causa é OUTRA, e apagar cache a cada duas
+# voltas do laço só trocaria um sintoma visível por um invisível.
+INTERVALO_MIN_LIMPEZA_CACHE_SEG = 1800
+_estado_limpeza_cache = {"quando": 0.0, "pedida": False}
 ARQUIVO_NOTIFICADAS = os.path.join(PASTA_DADOS, "os_notificadas.json")
 # Último agendamento visto por O.S. Existe para enxergar a REMARCAÇÃO: uma
 # O.S. que já foi improdutiva e ganha data nova é reincidência igual, mas
@@ -1811,13 +1834,45 @@ def gerar_e_enviar_termometro_capex():
     return True
 
 
+def _recorte_da_carga(regiao):
+    """O recorte da regional pedida. Sem regiao, o litoral, como sempre foi.
+
+    Ate 23/09/2026 esta funcao nao existia e a previa era SEMPRE a do litoral.
+    O /carga ja valia nos dois grupos de regiao, entao quem pedisse no grupo do
+    Rio recebia a tabela do litoral com cara de resposta certa -- erro calado,
+    o pior tipo. A regiao agora vem na mensagem, dita pelo proprio servico do
+    WhatsApp, que e quem conhece o JID de cada grupo.
+    """
+    import carga_litoral
+    import carga_rj
+
+    recortes = {
+        'litoral': carga_litoral.RECORTE_LITORAL,
+        'rj': carga_rj.RECORTE_RJ,
+    }
+    chave = (regiao or 'litoral').strip().lower()
+    recorte = recortes.get(chave)
+    if recorte is None:
+        # Nao acontece com a configuracao de hoje (o Node so conhece litoral e
+        # rj), mas se acontecer e melhor gritar do que mandar numero de outra
+        # regional. A imagem carrega o nome da regional, entao o engano
+        # aparece na tela de quem recebe.
+        logger.error("Regiao desconhecida na previa da carga: %r. Usando o litoral.",
+                     regiao)
+        recorte = recortes['litoral']
+    return recorte
+
+
 def gerar_e_enviar_carga(quando=None, destino_whatsapp=None,
-                         telegram=True, whatsapp=True, rodape=None):
+                         telegram=True, whatsapp=True, rodape=None,
+                         regiao=None):
     """A previa da carga do dia seguinte: capa e lista detalhada, em imagem.
 
     Vai para onde o comando foi dado -- `destino_whatsapp` e o JID do grupo que
     pediu. Sem ele, sai no grupo principal, que e como os relatorios agendados
     sempre sairam.
+
+    `regiao` diz QUAL regional contar: 'litoral' (padrao) ou 'rj'.
 
     A base e atualizada no OFS antes de contar. Prévia montada sobre um arquivo
     de uma hora atras erra de um jeito especialmente ruim: ela sai plausivel, e
@@ -1828,12 +1883,15 @@ def gerar_e_enviar_carga(quando=None, destino_whatsapp=None,
     import atualizar_bases
     import carga_litoral
     import carga_render
+    import previsao_chuva
 
     estado = atualizar_bases.garantir_ofs_fresco()
     aviso = atualizar_bases.aviso_de_frescor(estado)
 
+    recorte = _recorte_da_carga(regiao)
+
     try:
-        carga = carga_litoral.levantar_carga(quando=quando)
+        carga = carga_litoral.levantar_carga(quando=quando, recorte=recorte)
     except Exception:
         logger.exception("Erro ao levantar a previa da carga.")
         return False
@@ -1851,8 +1909,8 @@ def gerar_e_enviar_carga(quando=None, destino_whatsapp=None,
         # Nenhuma atividade nao vira imagem: tabela sem linha e figura de nada,
         # e o grupo merece a frase em vez do PNG vazio. Mesma regra da lista de
         # garantias.
-        recado = ("📋 *Prévia da carga — %s*\nNenhuma atividade no Litoral "
-                  "Norte para esse dia." % dia)
+        recado = ("📋 *Prévia da carga — %s*\nNenhuma atividade em %s "
+                  "para esse dia." % (dia, recorte.nome))
         if aviso:
             recado += "\n" + aviso
         if rodape:
@@ -1870,10 +1928,18 @@ def gerar_e_enviar_carga(quando=None, destino_whatsapp=None,
         logger.exception("Erro ao gerar as imagens da previa da carga.")
         return False
 
-    legenda_capa = ("📋 Prévia da carga — %s (%d O.S. no Litoral Norte)"
-                    % (dia, carga["total"]))
+    legenda_capa = ("📋 Prévia da carga — %s (%d O.S. no %s)"
+                    % (dia, carga["total"], recorte.nome))
     if aviso:
         legenda_capa += "\n" + aviso
+    # Risco de chuva por rota, se houver -- ver previsao_chuva.py. Função
+    # blindada: falha na consulta ao tempo não derruba a prévia, só sai sem
+    # a linha.
+    # Vale nas duas regionais desde 23/09/2026: quem escolhe a tabela de
+    # coordenadas e o proprio previsao_chuva, pela regiao que a carga carrega.
+    risco_chuva = previsao_chuva.linha_de_risco_de_chuva(carga)
+    if risco_chuva:
+        legenda_capa += "\n\n" + risco_chuva
     legenda_lista = "📋 Lista detalhada — %s" % dia
     # O rodapé é a instrução de uso, e ela vai na ÚLTIMA imagem de propósito:
     # na primeira, ela ficaria acima da tabela que a pessoa abriu para ler.
@@ -1896,14 +1962,26 @@ def gerar_e_enviar_carga(quando=None, destino_whatsapp=None,
     return True
 
 
-# A prévia sai sozinha no fim da tarde, no grupo do litoral.
+# A prévia sai sozinha no fim da tarde, no grupo de CADA regional.
 #
 # Os horários são regra da operação, não palpite: ver CARGA_AUTOMATICA_HORARIOS.
 #
-# O destino é o grupo do litoral porque a prévia é do litoral. Mandá-la no grupo
-# principal faria a operação do Rio ler todo dia uma tabela que não é dela.
+# Cada grupo recebe a SUA prévia, e nunca a do vizinho: mandar as duas no mesmo
+# lugar faria a operação de uma ler todo dia uma tabela que não é dela. É a
+# mesma razão pela qual a prévia nunca saiu no grupo principal.
+#
+# O destino no WhatsApp é a própria chave da regional -- quem resolve 'litoral'
+# e 'rj' para o JID de cada grupo é o serviço do Node (`gruposRegiao` no
+# config.json), que é o único lugar onde esses JIDs moram.
+#
+# O Rio entrou em 23/09/2026. A variável aceita lista separada por vírgula, e
+# continua aceitando um nome só -- quem já tivesse `CARGA_AUTOMATICA_DESTINO=
+# litoral` num drop-in segue recebendo só o litoral.
 CARGA_AUTOMATICA_ATIVA = os.environ.get('CARGA_AUTOMATICA_ATIVA', '1') != '0'
-CARGA_AUTOMATICA_DESTINO = os.environ.get('CARGA_AUTOMATICA_DESTINO', 'litoral')
+CARGA_AUTOMATICA_DESTINOS = tuple(
+    d.strip() for d in
+    os.environ.get('CARGA_AUTOMATICA_DESTINO', 'litoral,rj').split(',')
+    if d.strip())
 
 # Os horários em que a prévia sai sozinha, em HH:MM separados por vírgula.
 #
@@ -1968,7 +2046,7 @@ def _proximo_horario_da_carga(agora, horarios=None):
 
 
 def thread_agendador_carga():
-    """Manda a prévia da carga no grupo do litoral, todo dia às 15h40.
+    """Manda a prévia da carga no grupo de cada regional, todo dia às 15h40.
 
     Não dispara ao subir, de propósito: o serviço reinicia várias vezes por dia
     (bot, VPN, máquina), e um disparo por reinício encheria o grupo de prévias
@@ -1984,9 +2062,14 @@ def thread_agendador_carga():
                        CARGA_AUTOMATICA_HORARIOS_TEXTO)
         return
 
-    logger.info("Agendador da prévia da carga iniciado: todo dia às %s, no grupo %s.",
+    if not CARGA_AUTOMATICA_DESTINOS:
+        logger.warning("Prévia automática da carga sem destino em "
+                       "CARGA_AUTOMATICA_DESTINO. Nada será enviado.")
+        return
+
+    logger.info("Agendador da prévia da carga iniciado: todo dia às %s, para %s.",
                 ', '.join('%02d:%02d' % hm for hm in CARGA_AUTOMATICA_HORARIOS),
-                CARGA_AUTOMATICA_DESTINO)
+                ', '.join(CARGA_AUTOMATICA_DESTINOS))
 
     while True:
         agora = datetime.now()
@@ -2009,13 +2092,18 @@ def thread_agendador_carga():
         # lê -- é a mesma razão pela qual o aviso de falha do painel é
         # represado em vez de sair de hora em hora.
         primeiro_do_dia = (alvo.hour, alvo.minute) == CARGA_AUTOMATICA_HORARIOS[0]
-        try:
-            gerar_e_enviar_carga(
-                destino_whatsapp=CARGA_AUTOMATICA_DESTINO,
-                telegram=False,
-                rodape=AVISO_CARGA_AUTOMATICA if primeiro_do_dia else None)
-        except Exception:
-            logger.exception("Falha no envio agendado da prévia da carga.")
+        # Uma regional de cada vez, e cada uma no seu try: falha no Rio não
+        # pode cancelar a prévia do litoral, nem o contrário.
+        for destino in CARGA_AUTOMATICA_DESTINOS:
+            try:
+                gerar_e_enviar_carga(
+                    destino_whatsapp=destino,
+                    regiao=destino,
+                    telegram=False,
+                    rodape=AVISO_CARGA_AUTOMATICA if primeiro_do_dia else None)
+            except Exception:
+                logger.exception("Falha no envio agendado da prévia da carga (%s).",
+                                 destino)
 
         # Não dispara duas vezes no mesmo minuto se o envio inteiro for rápido.
         time.sleep(61)
@@ -2042,6 +2130,9 @@ def thread_agendador_termometro_capex(intervalo_seg):
         # e com números velhos, congelados no instante da pausa.
         if monitor_pausado():
             logger.info("Termômetro CAPEX pulado: monitoramento pausado (/desligar).")
+            continue
+        if 0 <= datetime.now().hour < 6:
+            logger.info("Termômetro CAPEX pulado: madrugada (0h-6h).")
             continue
         try:
             gerar_e_enviar_termometro_capex()
@@ -3857,8 +3948,13 @@ def montar_dossie_atual():
     )
 
 
-def montar_buscador_atual():
+def montar_buscador_atual(regiao=None):
     """O braço de busca do assistente, preso aos dados deste instante.
+
+    `regiao` diz de qual regional é o grupo que perguntou -- só a prévia da
+    carga depende disso, e sem ela o /bot respondia a carga do litoral mesmo
+    no grupo do Rio. Sem região, o litoral, como sempre foi no grupo principal
+    e no privado.
 
     Recebe a MESMA lista de chamados que o dossiê usou. Se a busca lesse a sua
     própria cópia, o retrato e a resposta poderiam discordar sobre o que está
@@ -3874,6 +3970,7 @@ def montar_buscador_atual():
             chamados=obter_lista_chamados_atual(),
             caminho_ofs_geral=localizar_ofs_geral(),
             agora=datetime.now(),
+            regiao=regiao,
         )
     except Exception:
         logger.exception("Falha ao preparar as buscas do /bot. "
@@ -3952,7 +4049,7 @@ def enviar_em_pedacos(enviar, texto, limite=3500):
 
 
 def responder_pergunta_bot(pergunta, whatsapp=False, chave=None,
-                           historico=None, destino=None):
+                           historico=None, destino=None, regiao=None):
     """Uma volta da conversa do /bot.
 
     Com `historico`, esta é a réplica a uma pergunta que o próprio bot fez: o
@@ -3987,7 +4084,7 @@ def responder_pergunta_bot(pergunta, whatsapp=False, chave=None,
 
     resultado = assistente_ia.responder(pergunta, dossie,
                                         historico=historico,
-                                        buscador=montar_buscador_atual())
+                                        buscador=montar_buscador_atual(regiao))
     texto = resultado['texto']
 
     if resultado['ok'] and resultado['aguardando']:
@@ -3997,6 +4094,11 @@ def responder_pergunta_bot(pergunta, whatsapp=False, chave=None,
             pendentes[chave] = {
                 'quando': time.time(),
                 'historico': resultado['historico'],
+                # A regional fica guardada com a conversa: a réplica vem sem
+                # /bot na frente e sem o campo da mensagem original, e sem
+                # isto a segunda volta responderia pelo litoral depois de a
+                # primeira ter respondido pelo Rio.
+                'regiao': regiao,
             }
         texto += ("\n\n(responda aqui mesmo, sem /bot, nos próximos "
                   f"{TIMEOUT_CONVERSA_BOT_SEG // 60} minutos)")
@@ -4047,7 +4149,8 @@ def continuar_conversa_bot(chave, texto_bruto, whatsapp=False, destino=None):
         args=(texto_bruto,),
         kwargs={'whatsapp': whatsapp, 'chave': chave,
                 'historico': pendente['historico'],
-                'destino': destino},
+                'destino': destino,
+                'regiao': pendente.get('regiao')},
         daemon=True,
     ).start()
     return True
@@ -6386,13 +6489,19 @@ def escutar_comandos_whatsapp():
                     # grupo que pediu, não no principal.
                     if _comando_bate(comando_grupo, "carga", "/carga",
                                      "previa", "/previa"):
-                        logger.info("/carga pedido no grupo %s.", conversa)
+                        logger.info("/carga pedido no grupo %s (regiao %s).",
+                                    conversa, msg.get("regiao") or "?")
                         enviar_alerta_whatsapp_grupo("⏳ Montando a prévia da carga (atualizo a base no OFS antes de contar, leva alguns segundos)...",
                                                      destino=conversa)
                         threading.Thread(
                             target=gerar_e_enviar_carga,
                             kwargs={'telegram': False,
-                                    'destino_whatsapp': conversa},
+                                    'destino_whatsapp': conversa,
+                                    # Quem diz a regional e o servico do Node,
+                                    # que conhece o JID de cada grupo. Sem isto
+                                    # o grupo do Rio recebia a tabela do
+                                    # litoral -- ver _recorte_da_carga.
+                                    'regiao': msg.get("regiao")},
                             daemon=True,
                         ).start()
                         continue
@@ -6409,8 +6518,9 @@ def escutar_comandos_whatsapp():
 
                     pergunta = texto_bruto[4:].strip() if len(texto_bruto) > 4 \
                         else ''
-                    logger.info("/bot pedido no grupo %s: %s",
-                                conversa, (pergunta or "(sem pergunta)")[:80])
+                    logger.info("/bot pedido no grupo %s (regiao %s): %s",
+                                conversa, msg.get("regiao") or "?",
+                                (pergunta or "(sem pergunta)")[:80])
                     AGUARDANDO_RESPOSTA_BOT_WHATSAPP.pop(conversa, None)
                     enviar_alerta_whatsapp_grupo("⏳ Pensando...",
                                                  destino=conversa)
@@ -6418,7 +6528,10 @@ def escutar_comandos_whatsapp():
                         target=responder_pergunta_bot,
                         args=(pergunta,),
                         kwargs={'whatsapp': True, 'chave': conversa,
-                                'destino': conversa},
+                                'destino': conversa,
+                                # Mesma razao do /carga: quem diz a regional e
+                                # o servico do Node, que conhece o JID.
+                                'regiao': msg.get("regiao")},
                         daemon=True,
                     ).start()
                     continue
@@ -6801,6 +6914,74 @@ def bot_f_presente_na_tela(pagina):
         return False
 
 
+def spa_em_branco(pagina):
+    """A SPA do CAMPO não montou -- `#app` vazio?
+
+    É o sintoma de BUNDLE VELHO EM CACHE. Quando o CAMPO republica o frontend, o
+    hash de `manifest.*.js` e `app.*.js` muda; o navegador, que guardou o
+    `index.html` antigo, segue pedindo os nomes velhos. O CAMPO responde **200 com
+    o próprio index.html** (fallback de SPA -- por isso NÃO aparece 404 nenhum
+    no log), o Chromium tenta executar HTML como JavaScript e morre em
+    `Unexpected token '<'` / `webpackJsonp is not defined`. A página fica
+    branca, sem um botão sequer, e a espera do 'Carregar chamados' nunca
+    termina.
+
+    Aconteceu em 22/09/2026 e custou 14h de silêncio: o deploy do CAMPO foi às
+    20:07, mas o bot só sentiu às 22:32, quando a VPN caiu e forçou o navegador
+    a reabrir e reler o cache. Sem esta checagem o laço esperava 120 s, matava o
+    navegador e recomeçava para sempre, sem avisar ninguém.
+    """
+    try:
+        return len(pagina.locator("#app").inner_html(timeout=5000) or "") == 0
+    except Exception as e:
+        # Não sei dizer -- e "não sei" aqui tem que significar "não mexe no
+        # cache", senão um erro de medição vira limpeza de perfil à toa.
+        logger.debug(f"Não consegui medir o #app: {e}")
+        return False
+
+
+def pedir_limpeza_de_cache(momento):
+    """Marca o cache para ser apagado quando o navegador fechar.
+
+    Não apaga aqui de propósito: o Chromium está com esses arquivos abertos, e
+    removê-los debaixo dele deixa o perfil num estado que ninguém testou. Quem
+    apaga é `limpar_cache_do_perfil`, no laço externo, com o navegador já morto.
+    """
+    agora = time.time()
+    desde = agora - _estado_limpeza_cache["quando"]
+    if desde < INTERVALO_MIN_LIMPEZA_CACHE_SEG:
+        logger.error(
+            "Tela do CAMPO em branco de novo (%s), mas o cache já foi limpo há %.0f min. "
+            "A causa é outra -- não vou limpar de novo.", momento, desde / 60)
+        return False
+    _estado_limpeza_cache["pedida"] = True
+    logger.error("Tela do CAMPO em branco (%s): a SPA não montou. Apagando o cache do "
+                 "perfil e reabrindo o navegador.", momento)
+    enviar_alerta_telegram(
+        "🟠 A tela do CAMPO abriu em branco (frontend novo, cache velho). "
+        "Apagando o cache do navegador e reabrindo sozinho -- a sessão é preservada."
+    )
+    return True
+
+
+def limpar_cache_do_perfil():
+    """Apaga só o cache do perfil. Roda com o navegador FECHADO."""
+    if not _estado_limpeza_cache["pedida"]:
+        return
+    import shutil
+    _estado_limpeza_cache["pedida"] = False
+    _estado_limpeza_cache["quando"] = time.time()
+    for nome in CACHE_DO_PERFIL:
+        caminho = os.path.join(CST_PERFIL_DIRETORIO, "Default", nome)
+        try:
+            shutil.rmtree(caminho)
+            logger.info("Cache do perfil apagado: %s", nome)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("Não consegui apagar o cache %s: %s", nome, e)
+
+
 def refazer_login(pagina):
     logger.warning("Mensagem 'Token não informado' detectada. Refazendo login...")
     enviar_alerta_telegram("🟡 Sessão expirada no CAMPO ('token não informado'). Refazendo login automaticamente...")
@@ -6837,7 +7018,12 @@ def refazer_login(pagina):
         registrar_batida_monitor()
 
         botao_carregar = pagina.locator(SELECTOR_BOTAO_CARREGAR_CHAMADOS)
-        botao_carregar.wait_for(state="visible", timeout=120000)
+        try:
+            botao_carregar.wait_for(state="visible", timeout=120000)
+        except PlaywrightTimeoutError:
+            if spa_em_branco(pagina) and pedir_limpeza_de_cache("relogin"):
+                raise TelaEmBrancoDoAir("Tela do CAMPO em branco; reabrindo com o cache limpo.")
+            raise
         registrar_batida_monitor()
         if botao_carregar.is_enabled():
             botao_carregar.first.click()
@@ -6846,6 +7032,10 @@ def refazer_login(pagina):
 
         enviar_alerta_telegram("🟢 Login refeito com sucesso no CAMPO. Monitoramento retomado normalmente.")
         return True
+    except TelaEmBrancoDoAir:
+        # Não é falha de login: é cache velho. Sobe para o laço externo, que
+        # fecha o navegador, apaga o cache e reabre.
+        raise
     except Exception as e:
         logger.error(f"Falha ao refazer login após 'token não informado': {e}")
         enviar_alerta_telegram(f"⚠️ Falha ao refazer login automaticamente: {e}")
@@ -8384,6 +8574,8 @@ def executar_monitoramento(exibir=None):
             logger.info("Rede confirmada. Prosseguindo com a abertura do navegador...")
 
         with sync_playwright() as p:
+            # Com o navegador fechado é a única hora segura de apagar o cache.
+            limpar_cache_do_perfil()
             logger.info("Iniciando navegador com perfil persistente...")
             try:
                 caminho_executavel = os.environ.get('PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH')
@@ -9367,7 +9559,12 @@ def executar_monitoramento(exibir=None):
 
                 logger.info("Aguardando botão 'Carregar chamados'...")
                 botao_carregar = pagina.locator(SELECTOR_BOTAO_CARREGAR_CHAMADOS)
-                botao_carregar.wait_for(state="visible", timeout=120000)
+                try:
+                    botao_carregar.wait_for(state="visible", timeout=120000)
+                except PlaywrightTimeoutError:
+                    if spa_em_branco(pagina) and pedir_limpeza_de_cache("primeira carga"):
+                        raise TelaEmBrancoDoAir("Tela do CAMPO em branco; reabrindo com o cache limpo.")
+                    raise
                 if botao_carregar.is_enabled():
                     logger.info("Clicando em 'Carregar chamados'...")
                     botao_carregar.first.click()
@@ -9780,6 +9977,16 @@ def main():
         # existindo, como saída manual. ============
         threading.Thread(
             target=ofs_base_historica.thread_agendador_base_historica,
+            args=(enviar_alerta_whatsapp_grupo,),
+            daemon=True,
+        ).start()
+
+        # ============ NOVO (13/09/2026): improdutivas técnicas do dia anterior,
+        # às 10h, no grupo de cada regional, agrupadas por técnico. Sobe DEPOIS
+        # do agendador das bases de propósito: é dessa base que a lista sai, e
+        # às 10h a reconstrução das 07:40 já passou. ============
+        threading.Thread(
+            target=improdutivas_dia.thread_agendador_improdutivas_dia,
             args=(enviar_alerta_whatsapp_grupo,),
             daemon=True,
         ).start()
